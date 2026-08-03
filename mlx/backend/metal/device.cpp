@@ -1,7 +1,9 @@
 // Copyright © 2023-2024 Apple Inc.
 
+#include <atomic>
 #include <cstdlib>
 #include <sstream>
+#include <string_view>
 
 #include <fmt/format.h>
 
@@ -33,6 +35,32 @@ namespace mlx::core::metal {
 namespace {
 
 constexpr const char* default_mtllib_path = METAL_PATH;
+
+bool profile_counters_enabled() {
+  static const bool enabled = std::getenv("MLX_PROFILE_METAL_COUNTERS") != nullptr;
+  return enabled;
+}
+
+std::atomic<uint64_t> profile_dispatch_threads{0};
+std::atomic<uint64_t> profile_dispatch_threadgroups{0};
+std::atomic<uint64_t> profile_primitive_evals{0};
+std::atomic<uint64_t> profile_astype_ops{0};
+std::atomic<uint64_t> profile_gather_qmm_ops{0};
+std::atomic<uint64_t> profile_quantized_matmul_ops{0};
+std::atomic<uint64_t> profile_custom_kernel_ops{0};
+std::atomic<uint64_t> profile_compiled_ops{0};
+std::atomic<uint64_t> profile_rms_norm_ops{0};
+std::atomic<uint64_t> profile_hc_sinkhorn_collapse_kernels{0};
+
+uint64_t count_occurrences(std::string_view value, std::string_view needle) {
+  uint64_t count = 0;
+  for (size_t offset = 0;
+       (offset = value.find(needle, offset)) != std::string_view::npos;
+       offset += needle.size()) {
+    count++;
+  }
+  return count;
+}
 
 void set_compile_options(
     MTL::CompileOptions* mtl_options,
@@ -303,6 +331,52 @@ MTL::Library* load_library(
 
 } // namespace
 
+MetalProfileCounters profile_counters() {
+  return {
+      profile_counters_enabled(),
+      profile_dispatch_threads.load(std::memory_order_relaxed),
+      profile_dispatch_threadgroups.load(std::memory_order_relaxed),
+      profile_primitive_evals.load(std::memory_order_relaxed),
+      profile_astype_ops.load(std::memory_order_relaxed),
+      profile_gather_qmm_ops.load(std::memory_order_relaxed),
+      profile_quantized_matmul_ops.load(std::memory_order_relaxed),
+      profile_custom_kernel_ops.load(std::memory_order_relaxed),
+      profile_compiled_ops.load(std::memory_order_relaxed),
+      profile_rms_norm_ops.load(std::memory_order_relaxed),
+      profile_hc_sinkhorn_collapse_kernels.load(std::memory_order_relaxed),
+  };
+}
+
+void profile_record_primitive(const char* name) {
+  if (!profile_counters_enabled()) {
+    return;
+  }
+  const std::string_view value{name};
+  profile_primitive_evals.fetch_add(1, std::memory_order_relaxed);
+  profile_astype_ops.fetch_add(
+      count_occurrences(value, "AsType"), std::memory_order_relaxed);
+  profile_gather_qmm_ops.fetch_add(
+      count_occurrences(value, "GatherQMM"), std::memory_order_relaxed);
+  profile_quantized_matmul_ops.fetch_add(
+      count_occurrences(value, "QuantizedMatmul"),
+      std::memory_order_relaxed);
+  profile_custom_kernel_ops.fetch_add(
+      count_occurrences(value, "CustomKernel"), std::memory_order_relaxed);
+  profile_compiled_ops.fetch_add(
+      count_occurrences(value, "Compiled"), std::memory_order_relaxed);
+  profile_rms_norm_ops.fetch_add(
+      count_occurrences(value, "RMSNorm"), std::memory_order_relaxed);
+}
+
+void profile_record_custom_kernel(const std::string& name) {
+  if (
+      profile_counters_enabled() &&
+      name.find("hc_sinkhorn_collapse") != std::string::npos) {
+    profile_hc_sinkhorn_collapse_kernels.fetch_add(
+        1, std::memory_order_relaxed);
+  }
+}
+
 CommandEncoder::CommandEncoder(
     Device& d,
     int index,
@@ -407,6 +481,9 @@ void CommandEncoder::dispatch_threadgroups(
     MTL::Size group_dims) {
   maybeInsertBarrier();
   buffer_ops_++;
+  if (profile_counters_enabled()) {
+    profile_dispatch_threadgroups.fetch_add(1, std::memory_order_relaxed);
+  }
   get_command_encoder()->dispatchThreadgroups(grid_dims, group_dims);
 }
 
@@ -415,6 +492,9 @@ void CommandEncoder::dispatch_threads(
     MTL::Size group_dims) {
   maybeInsertBarrier();
   buffer_ops_++;
+  if (profile_counters_enabled()) {
+    profile_dispatch_threads.fetch_add(1, std::memory_order_relaxed);
+  }
   get_command_encoder()->dispatchThreads(grid_dims, group_dims);
 }
 

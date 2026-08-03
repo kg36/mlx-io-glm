@@ -1,18 +1,30 @@
 // Copyright © 2023-2024 Apple Inc.
 
+#include <deque>
+#include <cmath>
+#include <cstring>
+#include <limits>
+#include <memory>
 #include <numeric>
 #include <ostream>
+#include <sstream>
+#include <unordered_map>
 #include <variant>
+
+#include <sys/mman.h>
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/pair.h>
+#include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
 
 #include "mlx/einsum.h"
+#include "mlx/expert_ssd_io_event.h"
+#include "mlx/io.h"
 #include "mlx/ops.h"
 #include "mlx/utils.h"
 #include "python/src/convert.h"
@@ -25,6 +37,171 @@ namespace nb = nanobind;
 using namespace nb::literals;
 
 using Scalar = std::variant<bool, int, double>;
+
+class ExpertSSDMarkovState {
+ public:
+  ExpertSSDMarkovState(size_t expert_count, size_t history_limit)
+      : expert_count_(expert_count),
+        history_limit_(history_limit),
+        transitions_(expert_count * expert_count, 0.0f),
+        totals_(expert_count, 0.0f) {
+    if (expert_count_ == 0 || history_limit_ == 0) {
+      throw std::invalid_argument(
+          "ExpertSSD Markov dimensions must be positive");
+    }
+  }
+
+  std::vector<float> update_and_score(
+      const std::vector<int64_t>& requested,
+      const std::vector<int64_t>& candidates) {
+    validate(requested);
+    validate(candidates);
+    size_t distance = 1;
+    for (auto iterator = history_.rbegin(); iterator != history_.rend();
+         ++iterator, ++distance) {
+      const auto weight = 1.0f / static_cast<float>(distance);
+      for (const auto previous : *iterator) {
+        auto* row = transitions_.data() + previous * expert_count_;
+        for (const auto expert : requested) {
+          row[expert] += weight;
+        }
+        totals_[previous] += weight;
+      }
+    }
+    history_.push_back(requested);
+    if (history_.size() > history_limit_) {
+      history_.pop_front();
+    }
+
+    std::vector<float> scores(candidates.size(), 0.0f);
+    for (size_t index = 0; index < candidates.size(); ++index) {
+      const auto candidate = candidates[index];
+      float score = 0.0f;
+      for (const auto expert : requested) {
+        const auto total = totals_[expert];
+        if (total > 0.0f) {
+          score += transitions_[expert * expert_count_ + candidate] / total;
+        }
+      }
+      scores[index] = score;
+    }
+    return scores;
+  }
+
+  std::string serialize() const {
+    std::string output("DSMK1", 5);
+    append(output, static_cast<uint32_t>(expert_count_));
+    append(output, static_cast<uint32_t>(history_limit_));
+    append(output, static_cast<uint32_t>(history_.size()));
+    append_bytes(output, transitions_.data(), transitions_.size());
+    append_bytes(output, totals_.data(), totals_.size());
+    for (const auto& route : history_) {
+      append(output, static_cast<uint32_t>(route.size()));
+      append_bytes(output, route.data(), route.size());
+    }
+    return output;
+  }
+
+  void restore(const std::string& payload) {
+    if (payload.size() < 5 || payload.compare(0, 5, "DSMK1") != 0) {
+      throw std::invalid_argument("ExpertSSD Markov snapshot has wrong format");
+    }
+    size_t offset = 5;
+    const auto expert_count = read<uint32_t>(payload, offset);
+    const auto history_limit = read<uint32_t>(payload, offset);
+    const auto history_size = read<uint32_t>(payload, offset);
+    if (expert_count != expert_count_ || history_limit != history_limit_ ||
+        history_size > history_limit_) {
+      throw std::invalid_argument(
+          "ExpertSSD Markov snapshot dimensions are incompatible");
+    }
+    std::vector<float> transitions(transitions_.size());
+    std::vector<float> totals(totals_.size());
+    read_bytes(payload, offset, transitions.data(), transitions.size());
+    read_bytes(payload, offset, totals.data(), totals.size());
+    const auto invalid_score = [](float value) {
+      return !std::isfinite(value) || value < 0.0f;
+    };
+    if (std::any_of(
+            transitions.begin(), transitions.end(), invalid_score) ||
+        std::any_of(totals.begin(), totals.end(), invalid_score)) {
+      throw std::invalid_argument(
+          "ExpertSSD Markov snapshot contains invalid scores");
+    }
+    std::deque<std::vector<int64_t>> history;
+    for (size_t index = 0; index < history_size; ++index) {
+      const auto route_size = read<uint32_t>(payload, offset);
+      if (route_size > expert_count_) {
+        throw std::invalid_argument(
+            "ExpertSSD Markov snapshot route is too large");
+      }
+      std::vector<int64_t> route(route_size);
+      read_bytes(payload, offset, route.data(), route.size());
+      validate(route);
+      history.push_back(std::move(route));
+    }
+    if (offset != payload.size()) {
+      throw std::invalid_argument(
+          "ExpertSSD Markov snapshot has trailing bytes");
+    }
+    transitions_ = std::move(transitions);
+    totals_ = std::move(totals);
+    history_ = std::move(history);
+  }
+
+ private:
+  template <typename T>
+  static void append(std::string& output, const T& value) {
+    output.append(reinterpret_cast<const char*>(&value), sizeof(T));
+  }
+
+  template <typename T>
+  static void append_bytes(
+      std::string& output,
+      const T* values,
+      size_t count) {
+    output.append(
+        reinterpret_cast<const char*>(values), count * sizeof(T));
+  }
+
+  template <typename T>
+  static T read(const std::string& payload, size_t& offset) {
+    T value;
+    read_bytes(payload, offset, &value, 1);
+    return value;
+  }
+
+  template <typename T>
+  static void read_bytes(
+      const std::string& payload,
+      size_t& offset,
+      T* values,
+      size_t count) {
+    const size_t bytes = count * sizeof(T);
+    if (offset > payload.size() || bytes > payload.size() - offset) {
+      throw std::invalid_argument("ExpertSSD Markov snapshot is truncated");
+    }
+    if (bytes != 0) {
+      std::memcpy(values, payload.data() + offset, bytes);
+    }
+    offset += bytes;
+  }
+
+  void validate(const std::vector<int64_t>& experts) const {
+    for (const auto expert : experts) {
+      if (expert < 0 || static_cast<size_t>(expert) >= expert_count_) {
+        throw std::invalid_argument(
+            "ExpertSSD Markov expert id is out of range");
+      }
+    }
+  }
+
+  size_t expert_count_;
+  size_t history_limit_;
+  std::vector<float> transitions_;
+  std::vector<float> totals_;
+  std::deque<std::vector<int64_t>> history_;
+};
 
 mx::Dtype scalar_to_dtype(Scalar s) {
   if (std::holds_alternative<int>(s)) {
@@ -53,7 +230,652 @@ mx::Shape to_shape(const nb::object& shape) {
   return nb::cast<mx::Shape>(shape);
 }
 
+mx::Dtype dtype_from_official_direct_string(const std::string& value) {
+  if (value == "BF16") {
+    return mx::bfloat16;
+  } else if (value == "F16") {
+    return mx::float16;
+  } else if (value == "F32") {
+    return mx::float32;
+  } else if (value == "I8") {
+    return mx::int8;
+  } else if (value == "I32") {
+    return mx::int32;
+  } else if (value == "I64") {
+    return mx::int64;
+  } else if (value == "U8") {
+    return mx::uint8;
+  } else if (value == "U16") {
+    return mx::uint16;
+  } else if (value == "U32") {
+    return mx::uint32;
+  } else if (value == "U64") {
+    return mx::uint64;
+  }
+  throw std::invalid_argument(
+      "[_open_expert_safetensors_direct] unsupported destination dtype " +
+      value);
+}
+
+struct OfficialDirectDestinationRows {
+  std::vector<char*> bases;
+  std::vector<size_t> row_nbytes;
+  size_t capacity{0};
+};
+
+OfficialDirectDestinationRows validate_official_direct_destinations(
+    const std::shared_ptr<mx::ExpertSafetensorsDirect>& direct,
+    std::vector<mx::array>& destinations) {
+  const auto& specs = direct->specs();
+  if (destinations.size() != specs.size()) {
+    std::ostringstream message;
+    message << "[_expert_ssd_direct_load_into] expected " << specs.size()
+            << " destination arrays, got " << destinations.size();
+    throw std::invalid_argument(message.str());
+  }
+  OfficialDirectDestinationRows rows;
+  rows.bases.reserve(destinations.size());
+  rows.row_nbytes.reserve(destinations.size());
+  for (size_t index = 0; index < destinations.size(); ++index) {
+    auto& destination = destinations[index];
+    const auto& spec = specs[index];
+    if (destination.ndim() < 1 || destination.dtype() != spec.dtype ||
+        static_cast<size_t>(destination.ndim()) != spec.shape.size() + 1 ||
+        !std::equal(
+            spec.shape.begin(),
+            spec.shape.end(),
+            destination.shape().begin() + 1)) {
+      throw std::invalid_argument(
+          "[_expert_ssd_direct_load_into] destination layout mismatch for " +
+          spec.name);
+    }
+    const auto capacity = static_cast<size_t>(destination.shape(0));
+    if (capacity == 0) {
+      throw std::invalid_argument(
+          "[_expert_ssd_direct_load_into] destination capacity is zero");
+    }
+    if (index == 0) {
+      rows.capacity = capacity;
+    } else if (capacity != rows.capacity) {
+      throw std::invalid_argument(
+          "[_expert_ssd_direct_load_into] destinations must share capacity");
+    }
+    if (!destination.is_available()) {
+      destination.eval();
+    }
+    if (!destination.flags().row_contiguous) {
+      throw std::invalid_argument(
+          "[_expert_ssd_direct_load_into] destinations must be row-contiguous");
+    }
+    rows.bases.push_back(destination.data<char>());
+    rows.row_nbytes.push_back(destination.nbytes() / capacity);
+  }
+  return rows;
+}
+
+template <typename T>
+nb::tuple official_direct_route_plan_impl(mx::array& indices) {
+  const auto size = indices.size();
+  const auto* data = indices.data<T>();
+  const auto shape = indices.shape();
+  const auto strides = indices.strides();
+  std::vector<int32_t> remapped;
+  remapped.reserve(size);
+  std::vector<int64_t> unique;
+  unique.reserve(std::min<size_t>(size, 256));
+  std::unordered_map<int64_t, int32_t> mapping;
+  std::unordered_map<int64_t, int32_t> counts;
+  mapping.reserve(std::min<size_t>(size, 512));
+  counts.reserve(std::min<size_t>(size, 512));
+
+  std::vector<size_t> coordinates(shape.size(), 0);
+  for (size_t flat = 0; flat < size; ++flat) {
+    size_t physical = 0;
+    for (size_t dimension = 0; dimension < shape.size(); ++dimension) {
+      physical += coordinates[dimension] * strides[dimension];
+    }
+    const auto expert = static_cast<int64_t>(data[physical]);
+    auto [iterator, inserted] =
+        mapping.emplace(expert, static_cast<int32_t>(unique.size()));
+    if (inserted) {
+      unique.push_back(expert);
+    }
+    remapped.push_back(iterator->second);
+    counts[expert] += 1;
+    for (int dimension = static_cast<int>(shape.size()) - 1;
+         dimension >= 0;
+         --dimension) {
+      coordinates[dimension] += 1;
+      if (coordinates[dimension] <
+          static_cast<size_t>(shape[dimension])) {
+        break;
+      }
+      coordinates[dimension] = 0;
+    }
+  }
+
+  nb::list unique_output;
+  nb::dict counts_output;
+  for (auto expert : unique) {
+    unique_output.append(nb::cast(expert));
+    counts_output[nb::cast(expert)] = nb::cast(counts[expert]);
+  }
+  auto remapped_array =
+      mx::array(remapped.begin(), indices.shape(), indices.dtype());
+  return nb::make_tuple(unique_output, counts_output, remapped_array);
+}
+
+nb::tuple official_direct_route_plan(mx::array indices) {
+  if (indices.ndim() == 0) {
+    throw std::invalid_argument(
+        "[_expert_ssd_route_plan] indices must have at least one dimension");
+  }
+  // A preceding ExpertSSD graph may be waiting on an IO-completion event
+  // published by a Python executor callback. Do not hold the GIL while this
+  // upstream graph completes or the callback cannot signal its Metal event.
+  {
+    nb::gil_scoped_release release;
+    indices.eval();
+  }
+  for (auto stride : indices.strides()) {
+    if (stride < 0) {
+      throw std::invalid_argument(
+          "[_expert_ssd_route_plan] negative strides are not supported");
+    }
+  }
+  if (indices.dtype() == mx::int32) {
+    return official_direct_route_plan_impl<int32_t>(indices);
+  } else if (indices.dtype() == mx::int64) {
+    return official_direct_route_plan_impl<int64_t>(indices);
+  } else if (indices.dtype() == mx::uint32) {
+    return official_direct_route_plan_impl<uint32_t>(indices);
+  } else if (indices.dtype() == mx::uint64) {
+    return official_direct_route_plan_impl<uint64_t>(indices);
+  }
+  throw std::invalid_argument(
+      "[_expert_ssd_route_plan] indices must be int32, int64, uint32, or uint64");
+}
+
 void init_ops(nb::module_& m) {
+  nb::class_<mx::ExpertSafetensorsDirect>(m, "_ExpertSafetensorsDirect");
+  nb::class_<mx::SafetensorsRowDirect>(m, "_SafetensorsRowDirect");
+  nb::class_<mx::ExpertSSDIoEventState>(m, "_ExpertSSDIoEventState");
+  nb::class_<ExpertSSDMarkovState>(m, "_ExpertSSDMarkovState");
+  m.def(
+      "_expert_ssd_markov_state_new",
+      [](size_t expert_count, size_t history_limit) {
+        return std::make_shared<ExpertSSDMarkovState>(
+            expert_count, history_limit);
+      },
+      "expert_count"_a,
+      "history_limit"_a,
+      nb::sig(
+          "def _expert_ssd_markov_state_new(expert_count: int, history_limit: int) -> _ExpertSSDMarkovState"));
+  m.def(
+      "_expert_ssd_markov_update",
+      [](std::shared_ptr<ExpertSSDMarkovState> state,
+         const std::vector<int64_t>& requested,
+         const std::vector<int64_t>& candidates) {
+        return state->update_and_score(requested, candidates);
+      },
+      "state"_a,
+      "requested"_a,
+      "candidates"_a,
+      nb::sig(
+          "def _expert_ssd_markov_update(state: _ExpertSSDMarkovState, requested: list[int], candidates: list[int]) -> list[float]"));
+  m.def(
+      "_expert_ssd_markov_snapshot",
+      [](std::shared_ptr<ExpertSSDMarkovState> state) {
+        auto payload = state->serialize();
+        return nb::bytes(payload.data(), payload.size());
+      },
+      "state"_a,
+      nb::sig(
+          "def _expert_ssd_markov_snapshot(state: _ExpertSSDMarkovState) -> bytes"));
+  m.def(
+      "_expert_ssd_markov_restore",
+      [](std::shared_ptr<ExpertSSDMarkovState> state, nb::bytes payload) {
+        char* data = nullptr;
+        Py_ssize_t size = 0;
+        if (PyBytes_AsStringAndSize(payload.ptr(), &data, &size) != 0) {
+          throw nb::python_error();
+        }
+        state->restore(std::string(data, static_cast<size_t>(size)));
+      },
+      "state"_a,
+      "payload"_a,
+      nb::sig(
+          "def _expert_ssd_markov_restore(state: _ExpertSSDMarkovState, payload: bytes) -> None"));
+  m.def(
+      "_expert_ssd_io_event_state_new",
+      []() { return mx::expert_ssd_io_event_state_new(); },
+      nb::sig(
+          "def _expert_ssd_io_event_state_new() -> _ExpertSSDIoEventState"));
+  m.def(
+      "_expert_ssd_io_gate",
+      [](const mx::array& x,
+         std::shared_ptr<mx::ExpertSSDIoEventState> state,
+         uint64_t value) {
+        return mx::expert_ssd_io_gate(x, state, value);
+      },
+      "x"_a,
+      "state"_a,
+      "value"_a,
+      nb::sig(
+          "def _expert_ssd_io_gate(x: array, state: _ExpertSSDIoEventState, value: int) -> array"));
+  m.def(
+      "_expert_ssd_io_event_signal",
+      [](std::shared_ptr<mx::ExpertSSDIoEventState> state, uint64_t value) {
+        mx::expert_ssd_io_event_signal(state, value);
+      },
+      "state"_a,
+      "value"_a,
+      nb::call_guard<nb::gil_scoped_release>(),
+      nb::sig(
+          "def _expert_ssd_io_event_signal(state: _ExpertSSDIoEventState, value: int) -> None"));
+  m.def(
+      "_expert_ssd_io_event_wait",
+      [](std::shared_ptr<mx::ExpertSSDIoEventState> state, uint64_t value) {
+        nb::gil_scoped_release release;
+        mx::expert_ssd_io_event_wait(state, value);
+      },
+      "state"_a,
+      "value"_a,
+      nb::sig(
+          "def _expert_ssd_io_event_wait(state: _ExpertSSDIoEventState, value: int) -> None"));
+  m.def(
+      "_expert_ssd_gpu_event_signal",
+      [](const mx::array& x,
+         std::shared_ptr<mx::ExpertSSDIoEventState> state,
+         uint64_t value) {
+        return mx::expert_ssd_gpu_event_signal(x, state, value);
+      },
+      "x"_a,
+      "state"_a,
+      "value"_a,
+      nb::sig(
+          "def _expert_ssd_gpu_event_signal(x: array, state: _ExpertSSDIoEventState, value: int) -> array"));
+  m.def(
+      "_expert_ssd_mxfp4_pair_qmv",
+      [](const mx::array& x,
+         const mx::array& up_weight,
+         const mx::array& up_scales,
+         const mx::array& gate_weight,
+         const mx::array& gate_scales,
+         const mx::array& routes) {
+        return mx::expert_ssd_mxfp4_pair_qmv(
+            x,
+            up_weight,
+            up_scales,
+            gate_weight,
+            gate_scales,
+            routes);
+      },
+      "x"_a,
+      "up_weight"_a,
+      "up_scales"_a,
+      "gate_weight"_a,
+      "gate_scales"_a,
+      "routes"_a,
+      nb::sig(
+          "def _expert_ssd_mxfp4_pair_qmv(x: array, up_weight: array, up_scales: array, gate_weight: array, gate_scales: array, routes: array) -> list[array]"));
+  m.def(
+      "_expert_ssd_mxfp4_masked_qmv",
+      [](const mx::array& x,
+         const mx::array& weight,
+         const mx::array& scales,
+         const mx::array& routes) {
+        return mx::expert_ssd_mxfp4_masked_qmv(
+            x,
+            weight,
+            scales,
+            routes);
+      },
+      "x"_a,
+      "weight"_a,
+      "scales"_a,
+      "routes"_a,
+      nb::sig(
+          "def _expert_ssd_mxfp4_masked_qmv(x: array, weight: array, scales: array, routes: array) -> array"));
+  m.def(
+      "_expert_ssd_route_plan",
+      &official_direct_route_plan,
+      "indices"_a,
+      nb::sig(
+          "def _expert_ssd_route_plan(indices: array) -> tuple[list[int], dict[int, int], array]"),
+      R"pbdoc(
+        Materialize routed indices once and return first-seen experts, their
+        selection counts, and compact remapped indices in one native pass.
+      )pbdoc");
+  m.def(
+      "_open_expert_safetensors_direct",
+      [](nb::object file,
+         const std::vector<std::vector<std::tuple<
+             std::string,
+             std::string,
+             std::vector<int64_t>,
+             size_t>>>& raw_expert_specs,
+         bool no_cache,
+         bool read_ahead) {
+        if (raw_expert_specs.empty()) {
+          throw std::invalid_argument(
+              "[_open_expert_safetensors_direct] expert specs must be non-empty");
+        }
+        std::vector<std::vector<mx::SafetensorsTensorSpec>> expert_specs;
+        expert_specs.reserve(raw_expert_specs.size());
+        for (const auto& raw_specs : raw_expert_specs) {
+          std::vector<mx::SafetensorsTensorSpec> specs;
+          specs.reserve(raw_specs.size());
+          for (const auto& item : raw_specs) {
+            const auto& [name, dtype_string, raw_shape, absolute_offset] = item;
+            mx::Shape shape;
+            shape.reserve(raw_shape.size());
+            for (auto dim : raw_shape) {
+              if (dim < 0 || dim > std::numeric_limits<int32_t>::max()) {
+                throw std::invalid_argument(
+                    "[_open_expert_safetensors_direct] invalid tensor shape");
+              }
+              shape.push_back(static_cast<int32_t>(dim));
+            }
+            specs.push_back(mx::SafetensorsTensorSpec{
+                name,
+                dtype_from_official_direct_string(dtype_string),
+                std::move(shape),
+                absolute_offset});
+          }
+          expert_specs.push_back(std::move(specs));
+        }
+        return std::make_shared<mx::ExpertSafetensorsDirect>(
+            nb::cast<std::string>(nb::str(file)),
+            std::move(expert_specs),
+            no_cache,
+            read_ahead);
+      },
+      "file"_a,
+      "expert_specs"_a,
+      "no_cache"_a = false,
+      "read_ahead"_a = true,
+      nb::sig(
+          "def _open_expert_safetensors_direct(file: Union[str, pathlib.Path], expert_specs: list[list[tuple[str, str, list[int], int]]], no_cache: bool = False, read_ahead: bool = True) -> _ExpertSafetensorsDirect"),
+      R"pbdoc(
+        Open one official checkpoint shard and cache the exact absolute tensor
+        offsets for every routed expert. Adjacent tensors are coalesced into
+        positioned scatter reads; no converted slab is required.
+      )pbdoc");
+  m.def(
+      "_open_safetensors_row_direct",
+      [](nb::object file,
+         const std::string& dtype,
+         int rows,
+         int columns,
+         size_t absolute_offset) {
+        return std::make_shared<mx::SafetensorsRowDirect>(
+            nb::cast<std::string>(nb::str(file)),
+            dtype_from_official_direct_string(dtype),
+            rows,
+            columns,
+            absolute_offset);
+      },
+      "file"_a,
+      "dtype"_a,
+      "rows"_a,
+      "columns"_a,
+      "absolute_offset"_a,
+      nb::sig(
+          "def _open_safetensors_row_direct(file: Union[str, pathlib.Path], dtype: str, rows: int, columns: int, absolute_offset: int) -> _SafetensorsRowDirect"));
+  m.def(
+      "_safetensors_row_direct_load",
+      [](std::shared_ptr<mx::SafetensorsRowDirect> direct,
+         const std::vector<size_t>& row_ids,
+         mx::array destination) {
+        if (!direct || destination.dtype() != direct->dtype() ||
+            destination.ndim() < 2 ||
+            destination.shape(-1) != direct->columns() ||
+            destination.size() / direct->columns() != row_ids.size()) {
+          throw std::invalid_argument(
+              "[_safetensors_row_direct_load] destination layout mismatch");
+        }
+        if (!destination.is_available()) {
+          destination.eval();
+        }
+        if (!destination.flags().row_contiguous) {
+          throw std::invalid_argument(
+              "[_safetensors_row_direct_load] destination must be row-contiguous");
+        }
+        nb::gil_scoped_release release;
+        direct->load_rows_into(
+            row_ids, destination.data<char>(), destination.nbytes());
+      },
+      "direct"_a,
+      "row_ids"_a,
+      "destination"_a,
+      nb::sig(
+          "def _safetensors_row_direct_load(direct: _SafetensorsRowDirect, row_ids: list[int], destination: array) -> None"));
+  m.def(
+      "_expert_safetensors_direct_read_range_count",
+      &mx::ExpertSafetensorsDirect::read_range_count,
+      "direct"_a,
+      "expert_id"_a,
+      nb::sig(
+          "def _expert_safetensors_direct_read_range_count(direct: _ExpertSafetensorsDirect, expert_id: int) -> int"));
+  m.def(
+      "_expert_safetensors_direct_advise_read",
+      [](std::shared_ptr<mx::ExpertSafetensorsDirect> direct,
+         size_t expert_id) {
+        if (!direct) {
+          throw std::invalid_argument(
+              "[_expert_safetensors_direct_advise_read] direct handle is null");
+        }
+        nb::gil_scoped_release release;
+        return direct->advise_read(expert_id);
+      },
+      "direct"_a,
+      "expert_id"_a,
+      nb::sig(
+          "def _expert_safetensors_direct_advise_read(direct: _ExpertSafetensorsDirect, expert_id: int) -> int"),
+      R"pbdoc(
+        Ask macOS to asynchronously warm the expert's source ranges in the
+        file cache without copying bytes into a Metal-visible destination.
+      )pbdoc");
+  m.def(
+      "_expert_ssd_direct_load_into",
+      [](std::shared_ptr<mx::ExpertSafetensorsDirect> direct,
+         size_t expert_id,
+         size_t slot,
+         std::vector<mx::array> destinations) {
+        if (!direct) {
+          throw std::invalid_argument(
+              "[_expert_ssd_direct_load_into] direct handle is null");
+        }
+        auto rows =
+            validate_official_direct_destinations(direct, destinations);
+        if (slot >= rows.capacity) {
+          throw std::out_of_range(
+              "[_expert_ssd_direct_load_into] destination slot is out of range");
+        }
+        std::vector<char*> pointers(rows.bases.size());
+        for (size_t index = 0; index < pointers.size(); ++index) {
+          pointers[index] =
+              rows.bases[index] + slot * rows.row_nbytes[index];
+        }
+        nb::gil_scoped_release release;
+        direct->load_ordered_into(expert_id, pointers, rows.row_nbytes);
+      },
+      "direct"_a,
+      "expert_id"_a,
+      "slot"_a,
+      "destinations"_a,
+      nb::sig(
+          "def _expert_ssd_direct_load_into(direct: _ExpertSafetensorsDirect, expert_id: int, slot: int, destinations: list[array]) -> None"),
+      R"pbdoc(
+        Read one expert directly from the official checkpoint into a row of
+        pre-evaluated MLX slot arrays. This mutates the destination buffers;
+        callers must not overwrite rows still used by in-flight computation.
+      )pbdoc");
+  m.def(
+      "_expert_ssd_direct_load_into_many",
+      [](std::shared_ptr<mx::ExpertSafetensorsDirect> direct,
+         const std::vector<size_t>& expert_ids,
+         const std::vector<size_t>& slots,
+         std::vector<mx::array> destinations) {
+        if (!direct || expert_ids.size() != slots.size()) {
+          throw std::invalid_argument(
+              "[_expert_ssd_direct_load_into_many] invalid handle or row lists");
+        }
+        auto rows =
+            validate_official_direct_destinations(direct, destinations);
+        for (auto slot : slots) {
+          if (slot >= rows.capacity) {
+            throw std::out_of_range(
+                "[_expert_ssd_direct_load_into_many] destination slot is out of range");
+          }
+        }
+        nb::gil_scoped_release release;
+        std::vector<char*> pointers(rows.bases.size());
+        for (size_t item = 0; item < expert_ids.size(); ++item) {
+          for (size_t index = 0; index < pointers.size(); ++index) {
+            pointers[index] =
+                rows.bases[index] + slots[item] * rows.row_nbytes[index];
+          }
+          direct->load_ordered_into(
+              expert_ids[item], pointers, rows.row_nbytes);
+        }
+      },
+      "direct"_a,
+      "expert_ids"_a,
+      "slots"_a,
+      "destinations"_a,
+      nb::sig(
+          "def _expert_ssd_direct_load_into_many(direct: _ExpertSafetensorsDirect, expert_ids: list[int], slots: list[int], destinations: list[array]) -> None"));
+  m.def(
+      "_expert_ssd_copy_rows",
+      [](std::vector<mx::array> sources,
+         const std::vector<size_t>& source_rows,
+         std::vector<mx::array> destinations,
+         const std::vector<size_t>& destination_rows) {
+        if (sources.empty() || sources.size() != destinations.size() ||
+            source_rows.size() != destination_rows.size()) {
+          throw std::invalid_argument(
+              "[_expert_ssd_copy_rows] incompatible tensor or row lists");
+        }
+        struct RowCopy {
+          const char* source;
+          char* destination;
+          size_t nbytes;
+        };
+        std::vector<RowCopy> copies;
+        copies.reserve(sources.size() * source_rows.size());
+        size_t copied_bytes = 0;
+        for (size_t tensor = 0; tensor < sources.size(); ++tensor) {
+          auto& source = sources[tensor];
+          auto& destination = destinations[tensor];
+          if (!source.is_available()) {
+            source.eval();
+          }
+          if (!destination.is_available()) {
+            destination.eval();
+          }
+          if (source.ndim() < 1 || destination.ndim() != source.ndim() ||
+              source.dtype() != destination.dtype() ||
+              !std::equal(
+                  source.shape().begin() + 1,
+                  source.shape().end(),
+                  destination.shape().begin() + 1) ||
+              !source.flags().row_contiguous ||
+              !destination.flags().row_contiguous) {
+            throw std::invalid_argument(
+                "[_expert_ssd_copy_rows] source/destination layout mismatch");
+          }
+          const auto source_capacity = static_cast<size_t>(source.shape(0));
+          const auto destination_capacity =
+              static_cast<size_t>(destination.shape(0));
+          const auto source_row_nbytes = source.nbytes() / source_capacity;
+          const auto destination_row_nbytes =
+              destination.nbytes() / destination_capacity;
+          if (source_row_nbytes != destination_row_nbytes) {
+            throw std::invalid_argument(
+                "[_expert_ssd_copy_rows] row byte sizes differ");
+          }
+          for (size_t row = 0; row < source_rows.size(); ++row) {
+            if (source_rows[row] >= source_capacity ||
+                destination_rows[row] >= destination_capacity) {
+              throw std::out_of_range(
+                  "[_expert_ssd_copy_rows] row is out of range");
+            }
+            const auto* source_pointer =
+                source.data<char>() + source_rows[row] * source_row_nbytes;
+            auto* destination_pointer = destination.data<char>() +
+                destination_rows[row] * destination_row_nbytes;
+            if (source_pointer == destination_pointer) {
+              throw std::invalid_argument(
+                  "[_expert_ssd_copy_rows] source and destination rows alias");
+            }
+            copies.push_back(
+                {source_pointer, destination_pointer, source_row_nbytes});
+            copied_bytes += source_row_nbytes;
+          }
+        }
+        {
+          nb::gil_scoped_release release;
+          for (const auto& copy : copies) {
+            std::memcpy(copy.destination, copy.source, copy.nbytes);
+          }
+        }
+        return copied_bytes;
+      },
+      "sources"_a,
+      "source_rows"_a,
+      "destinations"_a,
+      "destination_rows"_a,
+      nb::sig(
+          "def _expert_ssd_copy_rows(sources: list[array], source_rows: list[int], destinations: list[array], destination_rows: list[int]) -> int"),
+      R"pbdoc(
+        Copy evaluated, row-contiguous expert tensors between disjoint MLX
+        buffers. Callers must finish every GPU reader of both row sets first.
+      )pbdoc");
+  m.def(
+      "_expert_ssd_wire_arrays",
+      [](std::vector<mx::array> arrays) {
+        size_t wired = 0;
+        for (auto& array : arrays) {
+          if (!array.is_available()) {
+            array.eval();
+          }
+          if (!array.flags().row_contiguous) {
+            throw std::invalid_argument(
+                "[_expert_ssd_wire_arrays] arrays must be row-contiguous");
+          }
+          nb::gil_scoped_release release;
+          if (::mlock(array.data<char>(), array.nbytes()) == 0) {
+            wired += array.nbytes();
+          }
+        }
+        return wired;
+      },
+      "arrays"_a,
+      nb::sig("def _expert_ssd_wire_arrays(arrays: list[array]) -> int"),
+      R"pbdoc(
+        Best-effort wire evaluated slot-pool buffers so macOS cannot compress
+        or page out resident expert rows between Metal layer uses. Returns the
+        number of bytes successfully wired.
+      )pbdoc");
+  m.def(
+      "_expert_ssd_unwire_arrays",
+      [](std::vector<mx::array> arrays) {
+        size_t unwired = 0;
+        for (auto& array : arrays) {
+          if (!array.is_available() || !array.flags().row_contiguous) {
+            continue;
+          }
+          nb::gil_scoped_release release;
+          if (::munlock(array.data<char>(), array.nbytes()) == 0) {
+            unwired += array.nbytes();
+          }
+        }
+        return unwired;
+      },
+      "arrays"_a,
+      nb::sig("def _expert_ssd_unwire_arrays(arrays: list[array]) -> int"));
   m.def(
       "reshape",
       &mx::reshape,

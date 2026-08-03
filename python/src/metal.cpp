@@ -33,6 +33,23 @@ void init_metal(nb::module_& m) {
       R"pbdoc(
       Check if the Metal back-end is available.
       )pbdoc");
+  metal.def("_profile_counters", []() {
+    auto counters = mx::metal::profile_counters();
+    return std::unordered_map<std::string, uint64_t>{
+        {"enabled", counters.enabled},
+        {"dispatch_threads", counters.dispatch_threads},
+        {"dispatch_threadgroups", counters.dispatch_threadgroups},
+        {"dispatches", counters.dispatch_threads + counters.dispatch_threadgroups},
+        {"primitive_evals", counters.primitive_evals},
+        {"astype_ops", counters.astype_ops},
+        {"gather_qmm_ops", counters.gather_qmm_ops},
+        {"quantized_matmul_ops", counters.quantized_matmul_ops},
+        {"custom_kernel_ops", counters.custom_kernel_ops},
+        {"compiled_ops", counters.compiled_ops},
+        {"rms_norm_ops", counters.rms_norm_ops},
+        {"hc_sinkhorn_collapse_kernels", counters.hc_sinkhorn_collapse_kernels},
+    };
+  });
   metal.def("get_active_memory", []() {
     DEPRECATE("mx.metal.get_active_memory", "mx.get_active_memory");
     return mx::get_active_memory();

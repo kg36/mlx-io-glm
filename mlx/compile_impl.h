@@ -37,6 +37,10 @@ MLX_API void compile_clear_cache();
 // Return true if the cache is empty.
 MLX_API bool compile_cache_empty();
 
+// Diagnostic only: number of Python compiled functions and specialized cache
+// entries owned by the calling thread.
+MLX_API std::pair<size_t, size_t> compile_cache_counts();
+
 bool compile_available_for_device(const Device& device);
 
 std::tuple<std::vector<array>, std::vector<array>, std::shared_ptr<void>>

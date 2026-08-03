@@ -3,6 +3,7 @@
 #include "mlx/backend/common/metal_kernel.h"
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/metal/jit/includes.h"
+#include "mlx/backend/metal/metal.h"
 #include "mlx/backend/metal/utils.h"
 #include "mlx/fast_primitives.h"
 
@@ -21,6 +22,7 @@ static CustomKernelCache& cache() {
 void CustomKernel::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
+  metal::profile_record_custom_kernel(name_);
   // silence some warnings
   (void)is_precompiled_;
   (void)shared_memory_;

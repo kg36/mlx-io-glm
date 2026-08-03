@@ -1,9 +1,21 @@
 // Copyright © 2023 Apple Inc.
 
 #include <json.hpp>
+#include <algorithm>
+#include <cerrno>
+#include <cstring>
+#include <fcntl.h>
+#include <limits>
 #include <memory>
+#include <numeric>
 #include <sstream>
 #include <stack>
+
+#ifndef _WIN32
+#include <sys/stat.h>
+#include <sys/uio.h>
+#include <unistd.h>
+#endif
 
 #include "mlx/backend/cuda/cuda.h"
 #include "mlx/io.h"
@@ -35,6 +47,340 @@ using json = nlohmann::json;
 #define ST_C64 "C64"
 
 namespace mlx::core {
+
+namespace {
+
+size_t tensor_nbytes(const SafetensorsTensorSpec& spec) {
+  size_t nbytes = spec.dtype.size();
+  for (auto dim : spec.shape) {
+    if (dim < 0 ||
+        (dim != 0 && nbytes > std::numeric_limits<size_t>::max() /
+                static_cast<size_t>(dim))) {
+      throw std::invalid_argument(
+          "[ExpertSafetensorsDirect] invalid or overflowing tensor shape");
+    }
+    nbytes *= static_cast<size_t>(dim);
+  }
+  return nbytes;
+}
+
+#ifndef _WIN32
+void pread_exact(int fd, char* destination, size_t nbytes, size_t offset) {
+  size_t completed = 0;
+  while (completed < nbytes) {
+    auto result = ::pread(
+        fd,
+        destination + completed,
+        nbytes - completed,
+        static_cast<off_t>(offset + completed));
+    if (result < 0 && errno == EINTR) {
+      continue;
+    }
+    if (result <= 0) {
+      std::ostringstream message;
+      message << "[ExpertSafetensorsDirect] positioned read failed at offset "
+              << (offset + completed);
+      throw std::runtime_error(message.str());
+    }
+    completed += static_cast<size_t>(result);
+  }
+}
+#endif
+
+} // namespace
+
+ExpertSafetensorsDirect::ExpertSafetensorsDirect(
+    std::string file,
+    std::vector<std::vector<SafetensorsTensorSpec>> specs_by_expert,
+    bool no_cache,
+    bool read_ahead)
+    : file_(std::move(file)), specs_by_expert_(std::move(specs_by_expert)) {
+#ifdef _WIN32
+  throw std::runtime_error(
+      "[ExpertSafetensorsDirect] official-direct IO currently requires POSIX preadv");
+#else
+  if (specs_by_expert_.empty() || specs_by_expert_.front().empty()) {
+    throw std::invalid_argument(
+        "[ExpertSafetensorsDirect] expert tensor specs must be non-empty");
+  }
+  fd_ = ::open(file_.c_str(), O_RDONLY);
+  if (fd_ < 0) {
+    throw std::runtime_error(
+        "[ExpertSafetensorsDirect] failed to open file " + file_);
+  }
+#ifdef __APPLE__
+  if ((no_cache && ::fcntl(fd_, F_NOCACHE, 1) != 0) ||
+      (!read_ahead && ::fcntl(fd_, F_RDAHEAD, 0) != 0)) {
+    ::close(fd_);
+    fd_ = -1;
+    throw std::runtime_error(
+        "[ExpertSafetensorsDirect] failed to apply macOS file-cache policy");
+  }
+#else
+  if (no_cache || !read_ahead) {
+    ::close(fd_);
+    fd_ = -1;
+    throw std::runtime_error(
+        "[ExpertSafetensorsDirect] file-cache policy is supported only on macOS");
+  }
+#endif
+  struct stat info {};
+  if (::fstat(fd_, &info) != 0 || info.st_size < 0) {
+    ::close(fd_);
+    fd_ = -1;
+    throw std::runtime_error(
+        "[ExpertSafetensorsDirect] failed to stat file " + file_);
+  }
+  file_nbytes_ = static_cast<size_t>(info.st_size);
+
+  try {
+    const auto& canonical = specs_by_expert_.front();
+    ranges_by_expert_.reserve(specs_by_expert_.size());
+    for (size_t expert_id = 0; expert_id < specs_by_expert_.size(); ++expert_id) {
+      const auto& specs = specs_by_expert_[expert_id];
+      if (specs.size() != canonical.size()) {
+        throw std::invalid_argument(
+            "[ExpertSafetensorsDirect] experts must share a tensor count");
+      }
+      std::vector<size_t> sizes(specs.size());
+      std::vector<size_t> order(specs.size());
+      std::iota(order.begin(), order.end(), size_t{0});
+      for (size_t index = 0; index < specs.size(); ++index) {
+        const auto& spec = specs[index];
+        const auto& layout = canonical[index];
+        if (spec.name.empty() || spec.name != layout.name ||
+            spec.dtype != layout.dtype || spec.shape != layout.shape) {
+          throw std::invalid_argument(
+              "[ExpertSafetensorsDirect] experts must share canonical tensor layouts");
+        }
+        sizes[index] = tensor_nbytes(spec);
+        if (spec.absolute_offset > file_nbytes_ ||
+            sizes[index] > file_nbytes_ - spec.absolute_offset) {
+          std::ostringstream message;
+          message << "[ExpertSafetensorsDirect] tensor '" << spec.name
+                  << "' exceeds file bounds for expert " << expert_id;
+          throw std::invalid_argument(message.str());
+        }
+      }
+      std::sort(order.begin(), order.end(), [&](size_t left, size_t right) {
+        return specs[left].absolute_offset < specs[right].absolute_offset;
+      });
+
+      std::vector<ReadRange> ranges;
+      for (auto index : order) {
+        const auto offset = specs[index].absolute_offset;
+        const auto size = sizes[index];
+        if (!ranges.empty()) {
+          auto& previous = ranges.back();
+          const auto previous_end =
+              previous.absolute_offset + previous.byte_length;
+          if (offset < previous_end) {
+            throw std::invalid_argument(
+                "[ExpertSafetensorsDirect] source tensor ranges overlap");
+          }
+          if (offset == previous_end) {
+            previous.byte_length += size;
+            previous.tensor_indices.push_back(index);
+            continue;
+          }
+        }
+        ranges.push_back(ReadRange{offset, size, {index}});
+      }
+      ranges_by_expert_.push_back(std::move(ranges));
+    }
+  } catch (...) {
+    ::close(fd_);
+    fd_ = -1;
+    throw;
+  }
+#endif
+}
+
+ExpertSafetensorsDirect::~ExpertSafetensorsDirect() {
+#ifndef _WIN32
+  if (fd_ >= 0) {
+    ::close(fd_);
+  }
+#endif
+}
+
+SafetensorsRowDirect::SafetensorsRowDirect(
+    std::string file,
+    Dtype dtype,
+    int rows,
+    int columns,
+    size_t absolute_offset)
+    : file_(std::move(file)),
+      dtype_(dtype),
+      rows_(rows),
+      columns_(columns),
+      absolute_offset_(absolute_offset) {
+#ifdef _WIN32
+  throw std::runtime_error(
+      "[SafetensorsRowDirect] official-direct rows currently require POSIX pread");
+#else
+  if (rows_ <= 0 || columns_ <= 0) {
+    throw std::invalid_argument(
+        "[SafetensorsRowDirect] row tensor dimensions must be positive");
+  }
+  row_nbytes_ = static_cast<size_t>(columns_) * dtype_.size();
+  fd_ = ::open(file_.c_str(), O_RDONLY);
+  if (fd_ < 0) {
+    throw std::runtime_error(
+        "[SafetensorsRowDirect] failed to open file " + file_);
+  }
+  struct stat info {};
+  if (::fstat(fd_, &info) != 0 || info.st_size < 0) {
+    ::close(fd_);
+    fd_ = -1;
+    throw std::runtime_error(
+        "[SafetensorsRowDirect] failed to stat file " + file_);
+  }
+  const auto file_nbytes = static_cast<size_t>(info.st_size);
+  const auto tensor_nbytes = static_cast<size_t>(rows_) * row_nbytes_;
+  if (absolute_offset_ > file_nbytes ||
+      tensor_nbytes > file_nbytes - absolute_offset_) {
+    ::close(fd_);
+    fd_ = -1;
+    throw std::invalid_argument(
+        "[SafetensorsRowDirect] tensor exceeds file bounds");
+  }
+#endif
+}
+
+SafetensorsRowDirect::~SafetensorsRowDirect() {
+#ifndef _WIN32
+  if (fd_ >= 0) {
+    ::close(fd_);
+  }
+#endif
+}
+
+void SafetensorsRowDirect::load_rows_into(
+    const std::vector<size_t>& row_ids,
+    char* destination,
+    size_t destination_nbytes) const {
+#ifdef _WIN32
+  throw std::runtime_error(
+      "[SafetensorsRowDirect] official-direct rows currently require POSIX pread");
+#else
+  if (destination == nullptr || row_ids.empty() ||
+      destination_nbytes != row_ids.size() * row_nbytes_) {
+    throw std::invalid_argument(
+        "[SafetensorsRowDirect] invalid destination row buffer");
+  }
+  for (size_t item = 0; item < row_ids.size(); ++item) {
+    const auto row = row_ids[item];
+    if (row >= static_cast<size_t>(rows_)) {
+      throw std::out_of_range(
+          "[SafetensorsRowDirect] source row is out of range");
+    }
+    pread_exact(
+        fd_,
+        destination + item * row_nbytes_,
+        row_nbytes_,
+        absolute_offset_ + row * row_nbytes_);
+  }
+#endif
+}
+
+size_t ExpertSafetensorsDirect::read_range_count(size_t expert_id) const {
+  if (expert_id >= ranges_by_expert_.size()) {
+    throw std::out_of_range(
+        "[ExpertSafetensorsDirect] expert id is out of range");
+  }
+  return ranges_by_expert_[expert_id].size();
+}
+
+size_t ExpertSafetensorsDirect::advise_read(size_t expert_id) const {
+  if (expert_id >= ranges_by_expert_.size()) {
+    throw std::out_of_range(
+        "[ExpertSafetensorsDirect] expert id is out of range");
+  }
+#ifdef __APPLE__
+  size_t advised = 0;
+  for (const auto& range : ranges_by_expert_[expert_id]) {
+    if (range.byte_length > static_cast<size_t>(std::numeric_limits<int>::max())) {
+      throw std::overflow_error(
+          "[ExpertSafetensorsDirect] advisory range exceeds macOS limit");
+    }
+    struct radvisory advice {
+      static_cast<off_t>(range.absolute_offset),
+          static_cast<int>(range.byte_length)
+    };
+    if (::fcntl(fd_, F_RDADVISE, &advice) != 0) {
+      throw std::runtime_error(
+          "[ExpertSafetensorsDirect] macOS asynchronous read advice failed");
+    }
+    advised += range.byte_length;
+  }
+  return advised;
+#else
+  throw std::runtime_error(
+      "[ExpertSafetensorsDirect] asynchronous read advice requires macOS");
+#endif
+}
+
+void ExpertSafetensorsDirect::load_ordered_into(
+    size_t expert_id,
+    const std::vector<char*>& destinations,
+    const std::vector<size_t>& destination_nbytes) const {
+#ifdef _WIN32
+  throw std::runtime_error(
+      "[ExpertSafetensorsDirect] official-direct IO currently requires POSIX preadv");
+#else
+  if (expert_id >= specs_by_expert_.size()) {
+    throw std::out_of_range(
+        "[ExpertSafetensorsDirect] expert id is out of range");
+  }
+  const auto& specs = specs_by_expert_[expert_id];
+  if (destinations.size() != specs.size() ||
+      destination_nbytes.size() != specs.size()) {
+    throw std::invalid_argument(
+        "[ExpertSafetensorsDirect] destination count does not match tensor specs");
+  }
+  std::vector<size_t> sizes(specs.size());
+  for (size_t index = 0; index < specs.size(); ++index) {
+    sizes[index] = tensor_nbytes(specs[index]);
+    if (destinations[index] == nullptr ||
+        destination_nbytes[index] != sizes[index]) {
+      std::ostringstream message;
+      message << "[ExpertSafetensorsDirect] invalid destination for tensor '"
+              << specs[index].name << "'";
+      throw std::invalid_argument(message.str());
+    }
+  }
+
+  for (const auto& range : ranges_by_expert_[expert_id]) {
+    std::vector<struct iovec> vectors(range.tensor_indices.size());
+    for (size_t position = 0; position < range.tensor_indices.size(); ++position) {
+      const auto tensor_index = range.tensor_indices[position];
+      vectors[position].iov_base = destinations[tensor_index];
+      vectors[position].iov_len = sizes[tensor_index];
+    }
+    ssize_t result;
+    do {
+      result = ::preadv(
+          fd_,
+          vectors.data(),
+          static_cast<int>(vectors.size()),
+          static_cast<off_t>(range.absolute_offset));
+    } while (result < 0 && errno == EINTR);
+    if (result == static_cast<ssize_t>(range.byte_length)) {
+      continue;
+    }
+    // A short scatter read is rare, but exact positioned reads make recovery
+    // deterministic and overwrite any partially filled destinations.
+    for (auto tensor_index : range.tensor_indices) {
+      pread_exact(
+          fd_,
+          destinations[tensor_index],
+          sizes[tensor_index],
+          specs[tensor_index].absolute_offset);
+    }
+  }
+#endif
+}
 
 std::string dtype_to_safetensor_str(Dtype t) {
   switch (t) {

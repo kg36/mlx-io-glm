@@ -1535,6 +1535,14 @@ void init_transforms(nb::module_& m) {
         variable ``MLX_DISABLE_COMPILE`` if set.
       )pbdoc");
   m.def(
+      "_compile_cache_counts",
+      []() {
+        auto [functions, entries] = mx::detail::compile_cache_counts();
+        return nb::make_tuple(functions, entries);
+      },
+      nb::sig("def _compile_cache_counts() -> tuple[int, int]"),
+      "Return calling-thread compile function and specialization counts.");
+  m.def(
       "checkpoint",
       [](nb::callable fun) { return mlx_func(PyCheckpointedFun{fun}, fun); },
       "fun"_a,

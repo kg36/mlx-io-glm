@@ -6,6 +6,101 @@
 #include "mlx/backend/metal/kernels/quantized_utils.h"
 #include "mlx/backend/metal/kernels/fp_quantized.h"
 
+[[kernel]] void dsv4_mxfp4_pair_bf16(
+    const device uint32_t* up_weight [[buffer(0)]],
+    const device uint8_t* up_scales [[buffer(1)]],
+    const device uint32_t* gate_weight [[buffer(2)]],
+    const device uint8_t* gate_scales [[buffer(3)]],
+    const device bfloat16_t* x [[buffer(4)]],
+    const device uint32_t* routes [[buffer(5)]],
+    device bfloat16_t* up_output [[buffer(6)]],
+    device bfloat16_t* gate_output [[buffer(7)]],
+    const constant int& in_vec_size [[buffer(8)]],
+    const constant int& out_vec_size [[buffer(9)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  const uint route_position = tid.z;
+  const uint slot = routes[route_position];
+  if (slot == 0xffffffffu) {
+    if (simd_lid < 4u) {
+      const uint row = tid.y * 8u + simd_gid * 4u + simd_lid;
+      if (row < uint(out_vec_size)) {
+        up_output[ulong(route_position) * ulong(out_vec_size) + row] =
+            bfloat16_t(0.0f);
+        gate_output[ulong(route_position) * ulong(out_vec_size) + row] =
+            bfloat16_t(0.0f);
+      }
+    }
+    return;
+  }
+  const ulong weight_stride =
+      ulong(out_vec_size) * ulong(in_vec_size / 8);
+  const ulong scale_stride =
+      ulong(out_vec_size) * ulong(in_vec_size / 32);
+  const uint3 qmv_tid(0u, tid.y, 0u);
+  fp_qmv_fast_impl<bfloat16_t, 32, 4>(
+      up_weight + ulong(slot) * weight_stride,
+      up_scales + ulong(slot) * scale_stride,
+      x,
+      up_output + ulong(route_position) * ulong(out_vec_size),
+      in_vec_size,
+      out_vec_size,
+      qmv_tid,
+      simd_gid,
+      simd_lid);
+  fp_qmv_fast_impl<bfloat16_t, 32, 4>(
+      gate_weight + ulong(slot) * weight_stride,
+      gate_scales + ulong(slot) * scale_stride,
+      x,
+      gate_output + ulong(route_position) * ulong(out_vec_size),
+      in_vec_size,
+      out_vec_size,
+      qmv_tid,
+      simd_gid,
+      simd_lid);
+}
+
+[[kernel]] void dsv4_mxfp4_masked_down_bf16(
+    const device uint32_t* weight [[buffer(0)]],
+    const device uint8_t* scales [[buffer(1)]],
+    const device bfloat16_t* x [[buffer(2)]],
+    const device uint32_t* routes [[buffer(3)]],
+    device bfloat16_t* output [[buffer(4)]],
+    const constant int& in_vec_size [[buffer(5)]],
+    const constant int& out_vec_size [[buffer(6)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  const uint route_position = tid.z;
+  const uint slot = routes[route_position];
+  if (slot == 0xffffffffu) {
+    if (simd_lid < 4u) {
+      const uint row = tid.y * 8u + simd_gid * 4u + simd_lid;
+      if (row < uint(out_vec_size)) {
+        output[ulong(route_position) * ulong(out_vec_size) + row] =
+            bfloat16_t(0.0f);
+      }
+    }
+    return;
+  }
+  const ulong weight_stride =
+      ulong(out_vec_size) * ulong(in_vec_size / 8);
+  const ulong scale_stride =
+      ulong(out_vec_size) * ulong(in_vec_size / 32);
+  const uint3 qmv_tid(0u, tid.y, 0u);
+  fp_qmv_fast_impl<bfloat16_t, 32, 4>(
+      weight + ulong(slot) * weight_stride,
+      scales + ulong(slot) * scale_stride,
+      x + ulong(route_position) * ulong(in_vec_size),
+      output + ulong(route_position) * ulong(out_vec_size),
+      in_vec_size,
+      out_vec_size,
+      qmv_tid,
+      simd_gid,
+      simd_lid);
+}
+
 #define instantiate_quantized(mode, name, type, group_size, bits) \
   instantiate_kernel( \
       #mode "_" #name "_" #type "_gs_" #group_size "_b_" #bits, \

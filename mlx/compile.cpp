@@ -379,6 +379,14 @@ class CompilerCache {
     return cache_.empty();
   }
 
+  std::pair<size_t, size_t> counts() const {
+    size_t entries = 0;
+    for (const auto& [_, values] : cache_) {
+      entries += values.size();
+    }
+    return {cache_.size(), entries};
+  }
+
  private:
   CompilerCache() {
     // Make sure the allocator is fully
@@ -1202,6 +1210,10 @@ void compile_clear_cache() {
 
 bool compile_cache_empty() {
   return detail::compiler_cache().empty();
+}
+
+std::pair<size_t, size_t> compile_cache_counts() {
+  return detail::compiler_cache().counts();
 }
 
 } // namespace detail

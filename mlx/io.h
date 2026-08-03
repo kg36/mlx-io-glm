@@ -21,6 +21,104 @@ using SafetensorsLoad = std::pair<
     std::unordered_map<std::string, array>,
     std::unordered_map<std::string, std::string>>;
 
+/** Byte-preserving description of one tensor in an official safetensors file. */
+struct SafetensorsTensorSpec {
+  std::string name;
+  Dtype dtype;
+  Shape shape;
+  size_t absolute_offset;
+};
+
+/**
+ * Direct-to-buffer reader for routed experts in an official checkpoint shard.
+ *
+ * Tensor layouts are supplied once for every expert. Adjacent source tensors
+ * are coalesced into positioned scatter reads, while destination buffers stay
+ * in the caller's canonical tensor order. No converted weight artifact or MLX
+ * graph node is created on the load path.
+ */
+class MLX_API ExpertSafetensorsDirect {
+ public:
+  ExpertSafetensorsDirect(
+      std::string file,
+      std::vector<std::vector<SafetensorsTensorSpec>> specs_by_expert,
+      bool no_cache = false,
+      bool read_ahead = true);
+  ~ExpertSafetensorsDirect();
+
+  ExpertSafetensorsDirect(const ExpertSafetensorsDirect&) = delete;
+  ExpertSafetensorsDirect& operator=(const ExpertSafetensorsDirect&) = delete;
+
+  void load_ordered_into(
+      size_t expert_id,
+      const std::vector<char*>& destinations,
+      const std::vector<size_t>& destination_nbytes) const;
+
+  const std::vector<SafetensorsTensorSpec>& specs() const {
+    return specs_by_expert_.front();
+  }
+  size_t num_experts() const {
+    return specs_by_expert_.size();
+  }
+  size_t read_range_count(size_t expert_id) const;
+  size_t advise_read(size_t expert_id) const;
+
+ private:
+  struct ReadRange {
+    size_t absolute_offset;
+    size_t byte_length;
+    std::vector<size_t> tensor_indices;
+  };
+
+  std::string file_;
+  size_t file_nbytes_{0};
+  int fd_{-1};
+  std::vector<std::vector<SafetensorsTensorSpec>> specs_by_expert_;
+  std::vector<std::vector<ReadRange>> ranges_by_expert_;
+};
+
+/** Positioned row reader for a two-dimensional official safetensors tensor. */
+class MLX_API SafetensorsRowDirect {
+ public:
+  SafetensorsRowDirect(
+      std::string file,
+      Dtype dtype,
+      int rows,
+      int columns,
+      size_t absolute_offset);
+  ~SafetensorsRowDirect();
+
+  SafetensorsRowDirect(const SafetensorsRowDirect&) = delete;
+  SafetensorsRowDirect& operator=(const SafetensorsRowDirect&) = delete;
+
+  void load_rows_into(
+      const std::vector<size_t>& row_ids,
+      char* destination,
+      size_t destination_nbytes) const;
+
+  Dtype dtype() const {
+    return dtype_;
+  }
+  int rows() const {
+    return rows_;
+  }
+  int columns() const {
+    return columns_;
+  }
+  size_t row_nbytes() const {
+    return row_nbytes_;
+  }
+
+ private:
+  std::string file_;
+  Dtype dtype_;
+  int rows_;
+  int columns_;
+  size_t absolute_offset_;
+  size_t row_nbytes_;
+  int fd_{-1};
+};
+
 /** Save array to out stream in .npy format */
 MLX_API void save(std::shared_ptr<io::Writer> out_stream, array a);
 

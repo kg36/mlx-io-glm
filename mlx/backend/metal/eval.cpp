@@ -3,6 +3,7 @@
 
 #include "mlx/backend/gpu/eval.h"
 #include "mlx/backend/metal/device.h"
+#include "mlx/backend/metal/metal.h"
 #include "mlx/backend/metal/utils.h"
 #include "mlx/primitives.h"
 #include "mlx/scheduler.h"
@@ -42,6 +43,7 @@ void eval(array& arr) {
     }
 
     debug_set_primitive_buffer_label(command_buffer, arr.primitive());
+    metal::profile_record_primitive(arr.primitive().name());
     arr.primitive().eval_gpu(arr.inputs(), outputs);
   }
   std::unordered_set<std::shared_ptr<array::Data>> buffers;
