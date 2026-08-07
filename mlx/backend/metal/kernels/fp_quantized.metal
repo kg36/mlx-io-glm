@@ -33,6 +33,24 @@ METAL_FUNC uint dsv4_scalex_lower_bound(
   return lo;
 }
 
+METAL_FUNC uint8_t dsv4_scalex_primary_value(
+    const device uint8_t* record,
+    const device uint8_t* primary,
+    uint codec,
+    uint raw_index) {
+  if (codec == 0u) {
+    return primary[raw_index];
+  } else if (codec == 1u) {
+    const uint code =
+        (uint(primary[raw_index >> 3]) >> (raw_index & 7u)) & 1u;
+    return record[5u + code];
+  } else {
+    const uint code =
+        (uint(primary[raw_index >> 2]) >> ((raw_index & 3u) << 1)) & 3u;
+    return record[5u + code];
+  }
+}
+
 METAL_FUNC uint8_t dsv4_scalex_value(
     const device uint8_t* record,
     const device uint8_t* primary,
@@ -42,18 +60,8 @@ METAL_FUNC uint8_t dsv4_scalex_value(
     uint raw_index,
     uint exception_begin,
     uint exception_end) {
-  uint8_t value;
-  if (codec == 0u) {
-    value = primary[raw_index];
-  } else if (codec == 1u) {
-    const uint code =
-        (uint(primary[raw_index >> 3]) >> (raw_index & 7u)) & 1u;
-    value = record[5u + code];
-  } else {
-    const uint code =
-        (uint(primary[raw_index >> 2]) >> ((raw_index & 3u) << 1)) & 3u;
-    value = record[5u + code];
-  }
+  const uint8_t value =
+      dsv4_scalex_primary_value(record, primary, codec, raw_index);
 
   // Exceptions are sparse (roughly hundreds over 786,432 scale bytes). The
   // caller narrows this loop to one output row, so most rows execute zero
@@ -70,6 +78,7 @@ template <typename T, int group_size, int bits>
 METAL_FUNC void dsv4_scalex_qmv_fast_impl(
     const device uint32_t* w,
     const device uint8_t* record,
+    threadgroup uint8_t* local_scales,
     uint scale_projection_offset,
     const device T* x,
     device T* y,
@@ -127,6 +136,29 @@ METAL_FUNC void dsv4_scalex_qmv_fast_impl(
   exception_begin = simd_shuffle(exception_begin, ushort(0));
   exception_end = simd_shuffle(exception_end, ushort(0));
 
+  // Decode only this SIMD group's four output rows into a 512-byte local
+  // tile. Sparse exceptions are applied once before QMV instead of being
+  // rescanned for every dot-product scale lookup.
+  const uint group_start =
+      scale_projection_offset + uint(out_row) * uint(in_vec_size_g);
+  const uint group_scale_count =
+      uint(results_per_simdgroup * in_vec_size_g);
+  for (uint local = simd_lid; local < group_scale_count; local += SIMD_SIZE) {
+    local_scales[local] = dsv4_scalex_primary_value(
+        record, primary, codec, group_start + local);
+  }
+  for (uint index = exception_begin + simd_lid;
+       index < exception_end;
+       index += SIMD_SIZE) {
+    const uint position =
+        dsv4_scalex_load_u32(positions + ulong(index) * 4ul);
+    const uint local = position - group_start;
+    if (local < group_scale_count) {
+      local_scales[local] = exception_values[index];
+    }
+  }
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+
   for (int k = 0; k < in_vec_size; k += block_size) {
     load_vector<T, U, values_per_thread>(x, x_thread);
     const uint scale_group =
@@ -134,17 +166,8 @@ METAL_FUNC void dsv4_scalex_qmv_fast_impl(
 
     for (int row = 0; row < results_per_simdgroup; ++row) {
       const device uint8_t* wl = ws + row * in_vec_size_w;
-      const uint raw_scale_index = scale_projection_offset +
-          uint(out_row + row) * uint(in_vec_size_g) + scale_group;
-      const uint8_t encoded_scale = dsv4_scalex_value(
-          record,
-          primary,
-          positions,
-          exception_values,
-          codec,
-          raw_scale_index,
-          exception_begin,
-          exception_end);
+      const uint8_t encoded_scale =
+          local_scales[uint(row) * uint(in_vec_size_g) + scale_group];
       const U scale = dequantize_scale<U, group_size>(encoded_scale);
       result[row] +=
           qdot<U, values_per_thread, bits>(wl, x_thread, scale);
@@ -270,6 +293,7 @@ METAL_FUNC void dsv4_scalex_qmv_fast_impl(
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
+  threadgroup uint8_t scale_tile[1024];
   const uint route_position = tid.z;
   const uint slot = routes[route_position];
   if (slot == 0xffffffffu) {
@@ -295,6 +319,7 @@ METAL_FUNC void dsv4_scalex_qmv_fast_impl(
   dsv4_scalex_qmv_fast_impl<bfloat16_t, 32, 4>(
       weight + ulong(slot) * weight_stride,
       record,
+      scale_tile + simd_gid * 512u,
       projection * scale_count,
       route_x,
       output + ulong(route_position) * ulong(out_vec_size),
