@@ -57,6 +57,8 @@ jobs:
               "_open_expert_safetensors_direct",
               "_expert_ssd_direct_load_into_many",
               "_open_scalex_mode_a_direct",
+              "_open_scalex_prefix_store",
+              "_scalex_mode_a_prefix_stats",
               "_scalex_mode_a_load_into_many",
               "_scalex_mode_a_load_experts_into_many",
           )
