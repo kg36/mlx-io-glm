@@ -985,7 +985,7 @@ void init_ops(nb::module_& m) {
         const size_t record_row_nbytes =
             record_destinations.nbytes() / capacity;
         if (capacity == 0 ||
-            record_row_nbytes < direct->maximum_encoded_nbytes()) {
+            record_row_nbytes < direct->maximum_indexed_nbytes()) {
           throw std::invalid_argument(
               "[_scalex_mode_b_load_experts_into_many] compressed record row is too small");
         }

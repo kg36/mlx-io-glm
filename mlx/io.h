@@ -131,6 +131,10 @@ class MLX_API ScaleXModeADirect {
     return decoded_tensor_nbytes_;
   }
   size_t maximum_encoded_nbytes() const;
+  // Mode-B rows append one uint16 exception prefix for every 512-scale tile,
+  // plus the terminal prefix. The index is built after the on-disk record
+  // lands and is never persisted in the checkpoint.
+  size_t maximum_indexed_nbytes() const;
 
  private:
   std::string file_;

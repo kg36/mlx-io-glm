@@ -9,28 +9,11 @@
 // LivSeek ScaleX Mode B keeps the complete lossless Mode-A record resident.
 // The record layout is:
 //   24-byte header, packed palette codes, sorted uint32 exception positions,
-//   uint8 exception values.
+//   uint8 exception values, even-byte padding, uint16 tile prefixes.
 // No hydrated scale tensor or model-wide scale sidecar is required.
 METAL_FUNC uint dsv4_scalex_load_u32(const device uint8_t* p) {
   return uint(p[0]) | (uint(p[1]) << 8) | (uint(p[2]) << 16) |
       (uint(p[3]) << 24);
-}
-
-METAL_FUNC uint dsv4_scalex_lower_bound(
-    const device uint8_t* positions,
-    uint count,
-    uint target) {
-  uint lo = 0;
-  uint hi = count;
-  while (lo < hi) {
-    const uint mid = lo + ((hi - lo) >> 1);
-    if (dsv4_scalex_load_u32(positions + ulong(mid) * 4ul) < target) {
-      lo = mid + 1;
-    } else {
-      hi = mid;
-    }
-  }
-  return lo;
 }
 
 METAL_FUNC uint8_t dsv4_scalex_primary_value(
@@ -49,29 +32,6 @@ METAL_FUNC uint8_t dsv4_scalex_primary_value(
         (uint(primary[raw_index >> 2]) >> ((raw_index & 3u) << 1)) & 3u;
     return record[5u + code];
   }
-}
-
-METAL_FUNC uint8_t dsv4_scalex_value(
-    const device uint8_t* record,
-    const device uint8_t* primary,
-    const device uint8_t* positions,
-    const device uint8_t* exception_values,
-    uint codec,
-    uint raw_index,
-    uint exception_begin,
-    uint exception_end) {
-  const uint8_t value =
-      dsv4_scalex_primary_value(record, primary, codec, raw_index);
-
-  // Exceptions are sparse (roughly hundreds over 786,432 scale bytes). The
-  // caller narrows this loop to one output row, so most rows execute zero
-  // iterations and rows with an exception normally execute one.
-  for (uint i = exception_begin; i < exception_end; ++i) {
-    if (dsv4_scalex_load_u32(positions + ulong(i) * 4ul) == raw_index) {
-      return exception_values[i];
-    }
-  }
-  return value;
 }
 
 template <typename T, int group_size, int bits>
@@ -103,6 +63,9 @@ METAL_FUNC void dsv4_scalex_qmv_fast_impl(
   const device uint8_t* positions = primary + primary_size;
   const device uint8_t* exception_values =
       positions + ulong(exception_count) * 4ul;
+  const uint encoded_size = 24u + primary_size + 5u * exception_count;
+  const device uint8_t* tile_prefix =
+      record + ((encoded_size + 1u) & ~1u);
 
   const device uint8_t* ws = (const device uint8_t*)w;
   typedef float U;
@@ -118,23 +81,20 @@ METAL_FUNC void dsv4_scalex_qmv_fast_impl(
   x += tid.x * in_vec_size + simd_lid * values_per_thread;
   y += tid.x * out_vec_size + out_row;
 
-  // One SIMD group owns four consecutive output rows. Search the sparse
-  // exception list once for the whole four-row interval; almost every such
-  // interval is empty, and this removes six of the eight per-row searches.
-  uint exception_begin = 0;
-  uint exception_end = 0;
+  // Up/gate SIMD groups own one 512-scale tile; down groups own one aligned
+  // half. The transient uint16 prefix appended by the I/O worker resolves the
+  // containing tile's sparse interval without two binary searches. The patch
+  // loop below rejects entries outside a down group's half.
+  uint exception_range = 0;
   if (simd_lid == 0u) {
     const uint group_start =
         scale_projection_offset + uint(out_row) * uint(in_vec_size_g);
-    exception_begin =
-        dsv4_scalex_lower_bound(positions, exception_count, group_start);
-    exception_end = dsv4_scalex_lower_bound(
-        positions,
-        exception_count,
-        group_start + uint(results_per_simdgroup * in_vec_size_g));
+    const uint tile = group_start >> 9;
+    exception_range = dsv4_scalex_load_u32(tile_prefix + 2u * tile);
   }
-  exception_begin = simd_shuffle(exception_begin, ushort(0));
-  exception_end = simd_shuffle(exception_end, ushort(0));
+  exception_range = simd_shuffle(exception_range, ushort(0));
+  const uint exception_begin = exception_range & 0xffffu;
+  const uint exception_end = exception_range >> 16;
 
   // Decode only this SIMD group's four output rows into a 512-byte local
   // tile. Sparse exceptions are applied once before QMV instead of being
@@ -143,9 +103,24 @@ METAL_FUNC void dsv4_scalex_qmv_fast_impl(
       scale_projection_offset + uint(out_row) * uint(in_vec_size_g);
   const uint group_scale_count =
       uint(results_per_simdgroup * in_vec_size_g);
-  for (uint local = simd_lid; local < group_scale_count; local += SIMD_SIZE) {
-    local_scales[local] = dsv4_scalex_primary_value(
-        record, primary, codec, group_start + local);
+  if (codec == 1u) {
+    const uint8_t palette0 = record[5];
+    const uint8_t palette1 = record[6];
+    for (uint local = simd_lid;
+         local < group_scale_count;
+         local += SIMD_SIZE) {
+      const uint raw_index = group_start + local;
+      const uint code =
+          (uint(primary[raw_index >> 3]) >> (raw_index & 7u)) & 1u;
+      local_scales[local] = code == 0u ? palette0 : palette1;
+    }
+  } else {
+    for (uint local = simd_lid;
+         local < group_scale_count;
+         local += SIMD_SIZE) {
+      local_scales[local] = dsv4_scalex_primary_value(
+          record, primary, codec, group_start + local);
+    }
   }
   for (uint index = exception_begin + simd_lid;
        index < exception_end;
