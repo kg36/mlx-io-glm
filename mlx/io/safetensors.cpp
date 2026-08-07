@@ -85,6 +85,186 @@ void pread_exact(int fd, char* destination, size_t nbytes, size_t offset) {
     completed += static_cast<size_t>(result);
   }
 }
+
+uint32_t read_u32_le(const unsigned char* source) {
+  return static_cast<uint32_t>(source[0]) |
+      (static_cast<uint32_t>(source[1]) << 8) |
+      (static_cast<uint32_t>(source[2]) << 16) |
+      (static_cast<uint32_t>(source[3]) << 24);
+}
+
+std::vector<unsigned char>& scalex_encoded_scratch(size_t nbytes) {
+  // Expert refills run on a bounded native worker pool. Retaining one grow-only
+  // buffer per worker avoids tens of thousands of allocator round trips while
+  // keeping scratch private to the calling thread.
+  thread_local std::vector<unsigned char> scratch;
+  scratch.resize(nbytes);
+  return scratch;
+}
+
+void decode_scalex_mode_a_into(
+    const std::vector<unsigned char>& encoded,
+    const std::array<char*, 3>& destinations,
+    const std::array<size_t, 3>& destination_nbytes) {
+  if (encoded.size() < 24 || std::memcmp(encoded.data(), "LSA1", 4) != 0) {
+    throw std::runtime_error("[ScaleXModeADirect] invalid Mode-A magic");
+  }
+  const auto codec = encoded[4];
+  if (codec > 2) {
+    throw std::runtime_error("[ScaleXModeADirect] invalid Mode-A codec");
+  }
+  const size_t raw_size = read_u32_le(encoded.data() + 12);
+  const size_t primary_size = read_u32_le(encoded.data() + 16);
+  const size_t exception_count = read_u32_le(encoded.data() + 20);
+  const size_t expected_raw = std::accumulate(
+      destination_nbytes.begin(), destination_nbytes.end(), size_t{0});
+  if (raw_size != expected_raw ||
+      exception_count >
+          (std::numeric_limits<size_t>::max() - 24 - primary_size) / 5 ||
+      24 + primary_size + 5 * exception_count != encoded.size()) {
+    throw std::runtime_error("[ScaleXModeADirect] invalid Mode-A record size");
+  }
+
+  const auto* primary = encoded.data() + 24;
+  size_t global_start = 0;
+  if (codec == 0) {
+    if (primary_size != raw_size || exception_count != 0) {
+      throw std::runtime_error("[ScaleXModeADirect] invalid raw Mode-A record");
+    }
+    for (size_t tensor = 0; tensor < destinations.size(); ++tensor) {
+      std::memcpy(
+          destinations[tensor],
+          primary + global_start,
+          destination_nbytes[tensor]);
+      global_start += destination_nbytes[tensor];
+    }
+    return;
+  }
+
+  const size_t bits = codec == 1 ? 1 : 2;
+  const size_t expected_primary = (raw_size * bits + 7) / 8;
+  if (primary_size != expected_primary) {
+    throw std::runtime_error("[ScaleXModeADirect] invalid Mode-A primary size");
+  }
+  const size_t values_per_byte = codec == 1 ? 8 : 4;
+  const bool tensor_boundaries_aligned = std::all_of(
+      destination_nbytes.begin(),
+      destination_nbytes.end(),
+      [values_per_byte](size_t value) {
+        return value % values_per_byte == 0;
+      });
+  if (!tensor_boundaries_aligned) {
+    const size_t code_mask = codec == 1 ? 1 : 3;
+    for (size_t tensor = 0; tensor < destinations.size(); ++tensor) {
+      auto* destination =
+          reinterpret_cast<unsigned char*>(destinations[tensor]);
+      for (size_t local = 0; local < destination_nbytes[tensor]; ++local) {
+        const size_t index = global_start + local;
+        const size_t bit_offset = index * bits;
+        const auto code =
+            (primary[bit_offset / 8] >> (bit_offset % 8)) & code_mask;
+        destination[local] = encoded[5 + code];
+      }
+      global_start += destination_nbytes[tensor];
+    }
+  } else if (codec == 1) {
+    struct OneBitLookup {
+      bool initialized{false};
+      std::array<unsigned char, 2> palette{};
+      std::array<uint64_t, 256> values{};
+    };
+    thread_local OneBitLookup cache;
+    const std::array<unsigned char, 2> palette{encoded[5], encoded[6]};
+    if (!cache.initialized || cache.palette != palette) {
+      for (size_t packed = 0; packed < cache.values.size(); ++packed) {
+        uint64_t expanded = 0;
+        for (size_t code = 0; code < 8; ++code) {
+          expanded |= static_cast<uint64_t>(
+                          palette[(packed >> code) & 1])
+              << (8 * code);
+        }
+        cache.values[packed] = expanded;
+      }
+      cache.palette = palette;
+      cache.initialized = true;
+    }
+    for (size_t tensor = 0; tensor < destinations.size(); ++tensor) {
+      if (destination_nbytes[tensor] % 8 != 0 || global_start % 8 != 0) {
+        throw std::runtime_error(
+            "[ScaleXModeADirect] one-bit tensor boundary is not byte aligned");
+      }
+      auto* destination =
+          reinterpret_cast<unsigned char*>(destinations[tensor]);
+      const auto* tensor_primary = primary + global_start / 8;
+      const size_t packed_bytes = destination_nbytes[tensor] / 8;
+      for (size_t index = 0; index < packed_bytes; ++index) {
+        const uint64_t expanded = cache.values[tensor_primary[index]];
+        std::memcpy(destination + 8 * index, &expanded, sizeof(expanded));
+      }
+      global_start += destination_nbytes[tensor];
+    }
+  } else {
+    struct TwoBitLookup {
+      bool initialized{false};
+      std::array<unsigned char, 4> palette{};
+      std::array<uint32_t, 256> values{};
+    };
+    thread_local TwoBitLookup cache;
+    const std::array<unsigned char, 4> palette{
+        encoded[5], encoded[6], encoded[7], encoded[8]};
+    if (!cache.initialized || cache.palette != palette) {
+      for (size_t packed = 0; packed < cache.values.size(); ++packed) {
+        uint32_t expanded = 0;
+        for (size_t code = 0; code < 4; ++code) {
+          expanded |= static_cast<uint32_t>(
+                          palette[(packed >> (2 * code)) & 3])
+              << (8 * code);
+        }
+        cache.values[packed] = expanded;
+      }
+      cache.palette = palette;
+      cache.initialized = true;
+    }
+    for (size_t tensor = 0; tensor < destinations.size(); ++tensor) {
+      if (destination_nbytes[tensor] % 4 != 0 || global_start % 4 != 0) {
+        throw std::runtime_error(
+            "[ScaleXModeADirect] two-bit tensor boundary is not byte aligned");
+      }
+      auto* destination =
+          reinterpret_cast<unsigned char*>(destinations[tensor]);
+      const auto* tensor_primary = primary + global_start / 4;
+      const size_t packed_bytes = destination_nbytes[tensor] / 4;
+      for (size_t index = 0; index < packed_bytes; ++index) {
+        const uint32_t expanded = cache.values[tensor_primary[index]];
+        std::memcpy(destination + 4 * index, &expanded, sizeof(expanded));
+      }
+      global_start += destination_nbytes[tensor];
+    }
+  }
+
+  const auto* positions = primary + primary_size;
+  const auto* values = positions + 4 * exception_count;
+  uint32_t previous = 0;
+  for (size_t index = 0; index < exception_count; ++index) {
+    const uint32_t position = read_u32_le(positions + 4 * index);
+    if (position >= raw_size || (index != 0 && position <= previous)) {
+      throw std::runtime_error(
+          "[ScaleXModeADirect] invalid Mode-A exception position");
+    }
+    size_t tensor = 0;
+    size_t local = position;
+    while (tensor < destination_nbytes.size() &&
+           local >= destination_nbytes[tensor]) {
+      local -= destination_nbytes[tensor++];
+    }
+    if (tensor >= destinations.size()) {
+      throw std::runtime_error(
+          "[ScaleXModeADirect] Mode-A exception exceeds destinations");
+    }
+    destinations[tensor][local] = static_cast<char>(values[index]);
+    previous = position;
+  }
+}
 #endif
 
 } // namespace
@@ -201,6 +381,184 @@ ExpertSafetensorsDirect::~ExpertSafetensorsDirect() {
   if (fd_ >= 0) {
     ::close(fd_);
   }
+#endif
+}
+
+ScaleXModeADirect::ScaleXModeADirect(
+    std::string file,
+    std::vector<ScaleXModeARecordSpec> records,
+    std::array<size_t, 3> decoded_tensor_nbytes,
+    bool no_cache,
+    bool read_ahead)
+    : file_(std::move(file)),
+      records_(std::move(records)),
+      decoded_tensor_nbytes_(decoded_tensor_nbytes) {
+#ifdef _WIN32
+  throw std::runtime_error(
+      "[ScaleXModeADirect] decode-on-arrival requires POSIX pread");
+#else
+  if (records_.empty() ||
+      std::any_of(
+          decoded_tensor_nbytes_.begin(),
+          decoded_tensor_nbytes_.end(),
+          [](size_t value) { return value == 0; })) {
+    throw std::invalid_argument(
+        "[ScaleXModeADirect] records and decoded tensor sizes must be non-empty");
+  }
+  fd_ = ::open(file_.c_str(), O_RDONLY);
+  if (fd_ < 0) {
+    throw std::runtime_error("[ScaleXModeADirect] failed to open file " + file_);
+  }
+#ifdef __APPLE__
+  if ((no_cache && ::fcntl(fd_, F_NOCACHE, 1) != 0) ||
+      (!read_ahead && ::fcntl(fd_, F_RDAHEAD, 0) != 0)) {
+    ::close(fd_);
+    fd_ = -1;
+    throw std::runtime_error(
+        "[ScaleXModeADirect] failed to apply macOS file-cache policy");
+  }
+#else
+  if (no_cache || !read_ahead) {
+    ::close(fd_);
+    fd_ = -1;
+    throw std::runtime_error(
+        "[ScaleXModeADirect] file-cache policy is supported only on macOS");
+  }
+#endif
+  struct stat info {};
+  if (::fstat(fd_, &info) != 0 || info.st_size < 0) {
+    ::close(fd_);
+    fd_ = -1;
+    throw std::runtime_error("[ScaleXModeADirect] failed to stat file " + file_);
+  }
+  file_nbytes_ = static_cast<size_t>(info.st_size);
+  for (const auto& record : records_) {
+    if (record.encoded_nbytes < 24 || record.absolute_offset > file_nbytes_ ||
+        record.encoded_nbytes > file_nbytes_ - record.absolute_offset) {
+      ::close(fd_);
+      fd_ = -1;
+      throw std::invalid_argument(
+          "[ScaleXModeADirect] encoded record exceeds file bounds");
+    }
+  }
+#endif
+}
+
+ScaleXModeADirect::~ScaleXModeADirect() {
+#ifndef _WIN32
+  if (fd_ >= 0) {
+    ::close(fd_);
+  }
+#endif
+}
+
+void ScaleXModeADirect::load_into(
+    size_t expert_id,
+    const std::array<char*, 3>& destinations,
+    const std::array<size_t, 3>& destination_nbytes) const {
+#ifdef _WIN32
+  throw std::runtime_error(
+      "[ScaleXModeADirect] decode-on-arrival requires POSIX pread");
+#else
+  if (expert_id >= records_.size()) {
+    throw std::out_of_range("[ScaleXModeADirect] expert id is out of range");
+  }
+  if (destination_nbytes != decoded_tensor_nbytes_ ||
+      std::any_of(
+          destinations.begin(), destinations.end(), [](char* value) {
+            return value == nullptr;
+          })) {
+    throw std::invalid_argument(
+        "[ScaleXModeADirect] destination tensor layout mismatch");
+  }
+  const auto& record = records_[expert_id];
+  auto& encoded = scalex_encoded_scratch(record.encoded_nbytes);
+  pread_exact(
+      fd_,
+      reinterpret_cast<char*>(encoded.data()),
+      encoded.size(),
+      record.absolute_offset);
+  decode_scalex_mode_a_into(encoded, destinations, destination_nbytes);
+#endif
+}
+
+void ScaleXModeADirect::load_expert_into(
+    size_t expert_id,
+    const std::array<char*, 3>& scale_destinations,
+    const std::array<size_t, 3>& scale_destination_nbytes,
+    const std::array<char*, 3>& weight_destinations,
+    const std::array<size_t, 3>& weight_destination_nbytes) const {
+#ifdef _WIN32
+  throw std::runtime_error(
+      "[ScaleXModeADirect] combined expert reads require POSIX preadv");
+#else
+  if (expert_id >= records_.size()) {
+    throw std::out_of_range("[ScaleXModeADirect] expert id is out of range");
+  }
+  if (scale_destination_nbytes != decoded_tensor_nbytes_ ||
+      std::any_of(
+          scale_destinations.begin(), scale_destinations.end(), [](char* value) {
+            return value == nullptr;
+          }) ||
+      std::any_of(
+          weight_destinations.begin(), weight_destinations.end(), [](char* value) {
+            return value == nullptr;
+          }) ||
+      std::any_of(
+          weight_destination_nbytes.begin(),
+          weight_destination_nbytes.end(),
+          [](size_t value) { return value == 0; })) {
+    throw std::invalid_argument(
+        "[ScaleXModeADirect] combined destination tensor layout mismatch");
+  }
+  const auto& record = records_[expert_id];
+  const size_t weight_bytes = std::accumulate(
+      weight_destination_nbytes.begin(),
+      weight_destination_nbytes.end(),
+      size_t{0});
+  if (record.absolute_offset > file_nbytes_ ||
+      record.encoded_nbytes > file_nbytes_ - record.absolute_offset ||
+      weight_bytes >
+          file_nbytes_ - record.absolute_offset - record.encoded_nbytes) {
+    throw std::runtime_error(
+        "[ScaleXModeADirect] combined expert range exceeds file bounds");
+  }
+
+  auto& encoded = scalex_encoded_scratch(record.encoded_nbytes);
+  std::array<struct iovec, 4> vectors{};
+  vectors[0].iov_base = encoded.data();
+  vectors[0].iov_len = encoded.size();
+  for (size_t tensor = 0; tensor < weight_destinations.size(); ++tensor) {
+    vectors[tensor + 1].iov_base = weight_destinations[tensor];
+    vectors[tensor + 1].iov_len = weight_destination_nbytes[tensor];
+  }
+  const size_t total_bytes = record.encoded_nbytes + weight_bytes;
+  ssize_t result;
+  do {
+    result = ::preadv(
+        fd_,
+        vectors.data(),
+        static_cast<int>(vectors.size()),
+        static_cast<off_t>(record.absolute_offset));
+  } while (result < 0 && errno == EINTR);
+  if (result != static_cast<ssize_t>(total_bytes)) {
+    pread_exact(
+        fd_,
+        reinterpret_cast<char*>(encoded.data()),
+        encoded.size(),
+        record.absolute_offset);
+    size_t offset = record.absolute_offset + record.encoded_nbytes;
+    for (size_t tensor = 0; tensor < weight_destinations.size(); ++tensor) {
+      pread_exact(
+          fd_,
+          weight_destinations[tensor],
+          weight_destination_nbytes[tensor],
+          offset);
+      offset += weight_destination_nbytes[tensor];
+    }
+  }
+  decode_scalex_mode_a_into(
+      encoded, scale_destinations, scale_destination_nbytes);
 #endif
 }
 
