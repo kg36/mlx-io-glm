@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include <array>
 #include <unordered_map>
 #include <variant>
 
@@ -75,6 +76,58 @@ class MLX_API ExpertSafetensorsDirect {
   int fd_{-1};
   std::vector<std::vector<SafetensorsTensorSpec>> specs_by_expert_;
   std::vector<std::vector<ReadRange>> ranges_by_expert_;
+};
+
+/** One compressed ScaleX Mode-A record in a routed-expert layer. */
+struct ScaleXModeARecordSpec {
+  size_t absolute_offset;
+  size_t encoded_nbytes;
+};
+
+/**
+ * Decode-on-arrival reader for the three E8M0 scale tensors of one expert.
+ *
+ * Records are stored in DeepSeek source order (w1/gate, w2/down, w3/up).
+ * The caller supplies three final U8 cache-row destinations in that order.
+ */
+class MLX_API ScaleXModeADirect {
+ public:
+  ScaleXModeADirect(
+      std::string file,
+      std::vector<ScaleXModeARecordSpec> records,
+      std::array<size_t, 3> decoded_tensor_nbytes,
+      bool no_cache = false,
+      bool read_ahead = true);
+  ~ScaleXModeADirect();
+
+  ScaleXModeADirect(const ScaleXModeADirect&) = delete;
+  ScaleXModeADirect& operator=(const ScaleXModeADirect&) = delete;
+
+  void load_into(
+      size_t expert_id,
+      const std::array<char*, 3>& destinations,
+      const std::array<size_t, 3>& destination_nbytes) const;
+
+  void load_expert_into(
+      size_t expert_id,
+      const std::array<char*, 3>& scale_destinations,
+      const std::array<size_t, 3>& scale_destination_nbytes,
+      const std::array<char*, 3>& weight_destinations,
+      const std::array<size_t, 3>& weight_destination_nbytes) const;
+
+  size_t num_experts() const {
+    return records_.size();
+  }
+  const std::array<size_t, 3>& decoded_tensor_nbytes() const {
+    return decoded_tensor_nbytes_;
+  }
+
+ private:
+  std::string file_;
+  size_t file_nbytes_{0};
+  int fd_{-1};
+  std::vector<ScaleXModeARecordSpec> records_;
+  std::array<size_t, 3> decoded_tensor_nbytes_{};
 };
 
 /** Positioned row reader for a two-dimensional official safetensors tensor. */

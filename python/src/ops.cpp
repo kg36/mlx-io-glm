@@ -313,6 +313,51 @@ OfficialDirectDestinationRows validate_official_direct_destinations(
   return rows;
 }
 
+struct ScaleXDestinationRows {
+  std::array<char*, 3> bases{};
+  std::array<size_t, 3> row_nbytes{};
+  size_t capacity{0};
+};
+
+ScaleXDestinationRows validate_scalex_destinations(
+    std::vector<mx::array>& destinations,
+    mx::Dtype dtype,
+    const std::array<size_t, 3>* expected_row_nbytes = nullptr) {
+  if (destinations.size() != 3) {
+    throw std::invalid_argument(
+        "[ScaleXModeADirect] expected three destination arrays");
+  }
+  ScaleXDestinationRows rows;
+  for (size_t tensor = 0; tensor < destinations.size(); ++tensor) {
+    auto& destination = destinations[tensor];
+    if (destination.ndim() < 1 || destination.dtype() != dtype) {
+      throw std::invalid_argument(
+          "[ScaleXModeADirect] destination dtype or rank changed");
+    }
+    const auto capacity = static_cast<size_t>(destination.shape(0));
+    if (capacity == 0 || (tensor != 0 && capacity != rows.capacity)) {
+      throw std::invalid_argument(
+          "[ScaleXModeADirect] incompatible destination capacities");
+    }
+    rows.capacity = capacity;
+    if (!destination.is_available()) {
+      destination.eval();
+    }
+    if (!destination.flags().row_contiguous) {
+      throw std::invalid_argument(
+          "[ScaleXModeADirect] destinations must be row-contiguous");
+    }
+    rows.row_nbytes[tensor] = destination.nbytes() / capacity;
+    if (expected_row_nbytes != nullptr &&
+        rows.row_nbytes[tensor] != (*expected_row_nbytes)[tensor]) {
+      throw std::invalid_argument(
+          "[ScaleXModeADirect] destination row size changed");
+    }
+    rows.bases[tensor] = destination.data<char>();
+  }
+  return rows;
+}
+
 template <typename T>
 nb::tuple official_direct_route_plan_impl(mx::array& indices) {
   const auto size = indices.size();
@@ -398,6 +443,7 @@ nb::tuple official_direct_route_plan(mx::array indices) {
 
 void init_ops(nb::module_& m) {
   nb::class_<mx::ExpertSafetensorsDirect>(m, "_ExpertSafetensorsDirect");
+  nb::class_<mx::ScaleXModeADirect>(m, "_ScaleXModeADirect");
   nb::class_<mx::SafetensorsRowDirect>(m, "_SafetensorsRowDirect");
   nb::class_<mx::ExpertSSDIoEventState>(m, "_ExpertSSDIoEventState");
   nb::class_<ExpertSSDMarkovState>(m, "_ExpertSSDMarkovState");
@@ -603,6 +649,40 @@ void init_ops(nb::module_& m) {
         positioned scatter reads; no converted slab is required.
       )pbdoc");
   m.def(
+      "_open_scalex_mode_a_direct",
+      [](nb::object file,
+         const std::vector<std::pair<size_t, size_t>>& raw_records,
+         const std::vector<size_t>& decoded_tensor_nbytes,
+         bool no_cache,
+         bool read_ahead) {
+        if (raw_records.empty() || decoded_tensor_nbytes.size() != 3) {
+          throw std::invalid_argument(
+              "[_open_scalex_mode_a_direct] expected records and three tensor sizes");
+        }
+        std::vector<mx::ScaleXModeARecordSpec> records;
+        records.reserve(raw_records.size());
+        for (const auto& [offset, length] : raw_records) {
+          records.push_back({offset, length});
+        }
+        std::array<size_t, 3> tensor_nbytes{
+            decoded_tensor_nbytes[0],
+            decoded_tensor_nbytes[1],
+            decoded_tensor_nbytes[2]};
+        return std::make_shared<mx::ScaleXModeADirect>(
+            nb::cast<std::string>(nb::str(file)),
+            std::move(records),
+            tensor_nbytes,
+            no_cache,
+            read_ahead);
+      },
+      "file"_a,
+      "records"_a,
+      "decoded_tensor_nbytes"_a,
+      "no_cache"_a = false,
+      "read_ahead"_a = true,
+      nb::sig(
+          "def _open_scalex_mode_a_direct(file: Union[str, pathlib.Path], records: list[tuple[int, int]], decoded_tensor_nbytes: list[int], no_cache: bool = False, read_ahead: bool = True) -> _ScaleXModeADirect"));
+  m.def(
       "_open_safetensors_row_direct",
       [](nb::object file,
          const std::string& dtype,
@@ -747,6 +827,122 @@ void init_ops(nb::module_& m) {
       "destinations"_a,
       nb::sig(
           "def _expert_ssd_direct_load_into_many(direct: _ExpertSafetensorsDirect, expert_ids: list[int], slots: list[int], destinations: list[array]) -> None"));
+  m.def(
+      "_scalex_mode_a_load_into_many",
+      [](std::shared_ptr<mx::ScaleXModeADirect> direct,
+         const std::vector<size_t>& expert_ids,
+         const std::vector<size_t>& slots,
+         std::vector<mx::array> destinations) {
+        if (!direct || expert_ids.size() != slots.size() ||
+            destinations.size() != 3) {
+          throw std::invalid_argument(
+              "[_scalex_mode_a_load_into_many] invalid handle or row lists");
+        }
+        const auto& expected = direct->decoded_tensor_nbytes();
+        std::array<char*, 3> bases{};
+        std::array<size_t, 3> row_nbytes{};
+        size_t capacity = 0;
+        for (size_t tensor = 0; tensor < destinations.size(); ++tensor) {
+          auto& destination = destinations[tensor];
+          if (destination.ndim() < 1 || destination.dtype() != mx::uint8) {
+            throw std::invalid_argument(
+                "[_scalex_mode_a_load_into_many] destinations must be U8 row arrays");
+          }
+          const auto tensor_capacity = static_cast<size_t>(destination.shape(0));
+          if (tensor_capacity == 0 ||
+              (tensor != 0 && tensor_capacity != capacity)) {
+            throw std::invalid_argument(
+                "[_scalex_mode_a_load_into_many] incompatible destination capacities");
+          }
+          capacity = tensor_capacity;
+          if (!destination.is_available()) {
+            destination.eval();
+          }
+          if (!destination.flags().row_contiguous) {
+            throw std::invalid_argument(
+                "[_scalex_mode_a_load_into_many] destinations must be row-contiguous");
+          }
+          row_nbytes[tensor] = destination.nbytes() / capacity;
+          if (row_nbytes[tensor] != expected[tensor]) {
+            throw std::invalid_argument(
+                "[_scalex_mode_a_load_into_many] destination row size changed");
+          }
+          bases[tensor] = destination.data<char>();
+        }
+        for (auto slot : slots) {
+          if (slot >= capacity) {
+            throw std::out_of_range(
+                "[_scalex_mode_a_load_into_many] destination slot is out of range");
+          }
+        }
+        nb::gil_scoped_release release;
+        std::array<char*, 3> pointers{};
+        for (size_t item = 0; item < expert_ids.size(); ++item) {
+          for (size_t tensor = 0; tensor < pointers.size(); ++tensor) {
+            pointers[tensor] =
+                bases[tensor] + slots[item] * row_nbytes[tensor];
+          }
+          direct->load_into(expert_ids[item], pointers, row_nbytes);
+        }
+      },
+      "direct"_a,
+      "expert_ids"_a,
+      "slots"_a,
+      "destinations"_a,
+      nb::sig(
+          "def _scalex_mode_a_load_into_many(direct: _ScaleXModeADirect, expert_ids: list[int], slots: list[int], destinations: list[array]) -> None"));
+  m.def(
+      "_scalex_mode_a_load_experts_into_many",
+      [](std::shared_ptr<mx::ScaleXModeADirect> direct,
+         const std::vector<size_t>& expert_ids,
+         const std::vector<size_t>& slots,
+         std::vector<mx::array> scale_destinations,
+         std::vector<mx::array> weight_destinations) {
+        if (!direct || expert_ids.size() != slots.size()) {
+          throw std::invalid_argument(
+              "[_scalex_mode_a_load_experts_into_many] invalid handle or row lists");
+        }
+        const auto scales = validate_scalex_destinations(
+            scale_destinations,
+            mx::uint8,
+            &direct->decoded_tensor_nbytes());
+        const auto weights = validate_scalex_destinations(
+            weight_destinations, mx::uint32);
+        if (weights.capacity != scales.capacity) {
+          throw std::invalid_argument(
+              "[_scalex_mode_a_load_experts_into_many] scale/weight capacities differ");
+        }
+        for (auto slot : slots) {
+          if (slot >= scales.capacity) {
+            throw std::out_of_range(
+                "[_scalex_mode_a_load_experts_into_many] destination slot is out of range");
+          }
+        }
+        nb::gil_scoped_release release;
+        std::array<char*, 3> scale_pointers{};
+        std::array<char*, 3> weight_pointers{};
+        for (size_t item = 0; item < expert_ids.size(); ++item) {
+          for (size_t tensor = 0; tensor < 3; ++tensor) {
+            scale_pointers[tensor] = scales.bases[tensor] +
+                slots[item] * scales.row_nbytes[tensor];
+            weight_pointers[tensor] = weights.bases[tensor] +
+                slots[item] * weights.row_nbytes[tensor];
+          }
+          direct->load_expert_into(
+              expert_ids[item],
+              scale_pointers,
+              scales.row_nbytes,
+              weight_pointers,
+              weights.row_nbytes);
+        }
+      },
+      "direct"_a,
+      "expert_ids"_a,
+      "slots"_a,
+      "scale_destinations"_a,
+      "weight_destinations"_a,
+      nb::sig(
+          "def _scalex_mode_a_load_experts_into_many(direct: _ScaleXModeADirect, expert_ids: list[int], slots: list[int], scale_destinations: list[array], weight_destinations: list[array]) -> None"));
   m.def(
       "_expert_ssd_copy_rows",
       [](std::vector<mx::array> sources,
