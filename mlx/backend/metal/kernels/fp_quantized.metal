@@ -6,6 +6,160 @@
 #include "mlx/backend/metal/kernels/quantized_utils.h"
 #include "mlx/backend/metal/kernels/fp_quantized.h"
 
+// LivSeek ScaleX Mode B keeps the complete lossless Mode-A record resident.
+// The record layout is:
+//   24-byte header, packed palette codes, sorted uint32 exception positions,
+//   uint8 exception values, even-byte padding, uint16 tile prefixes.
+// No hydrated scale tensor or model-wide scale sidecar is required.
+METAL_FUNC uint dsv4_scalex_load_u32(const device uint8_t* p) {
+  return uint(p[0]) | (uint(p[1]) << 8) | (uint(p[2]) << 16) |
+      (uint(p[3]) << 24);
+}
+
+METAL_FUNC uint8_t dsv4_scalex_primary_value(
+    const device uint8_t* record,
+    const device uint8_t* primary,
+    uint codec,
+    uint raw_index) {
+  if (codec == 0u) {
+    return primary[raw_index];
+  } else if (codec == 1u) {
+    const uint code =
+        (uint(primary[raw_index >> 3]) >> (raw_index & 7u)) & 1u;
+    return record[5u + code];
+  } else {
+    const uint code =
+        (uint(primary[raw_index >> 2]) >> ((raw_index & 3u) << 1)) & 3u;
+    return record[5u + code];
+  }
+}
+
+template <typename T, int group_size, int bits>
+METAL_FUNC void dsv4_scalex_qmv_fast_impl(
+    const device uint32_t* w,
+    const device uint8_t* record,
+    threadgroup uint8_t* local_scales,
+    uint scale_projection_offset,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int packs_per_thread = 2;
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int pack_factor = get_pack_factor<32, bits>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<32>();
+  constexpr int values_per_thread = pack_factor * packs_per_thread;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int scale_step_per_thread = group_size / values_per_thread;
+
+  const uint codec = uint(record[4]);
+  const uint primary_size = dsv4_scalex_load_u32(record + 16);
+  const uint exception_count = dsv4_scalex_load_u32(record + 20);
+  const device uint8_t* primary = record + 24;
+  const device uint8_t* positions = primary + primary_size;
+  const device uint8_t* exception_values =
+      positions + ulong(exception_count) * 4ul;
+  const uint encoded_size = 24u + primary_size + 5u * exception_count;
+  const device uint8_t* tile_prefix =
+      record + ((encoded_size + 1u) & ~1u);
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+  typedef float U;
+  thread U x_thread[values_per_thread];
+  thread U result[results_per_simdgroup] = {0};
+
+  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = in_vec_size / group_size;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+  x += tid.x * in_vec_size + simd_lid * values_per_thread;
+  y += tid.x * out_vec_size + out_row;
+
+  // Up/gate SIMD groups own one 512-scale tile; down groups own one aligned
+  // half. The transient uint16 prefix appended by the I/O worker resolves the
+  // containing tile's sparse interval without two binary searches. The patch
+  // loop below rejects entries outside a down group's half.
+  uint exception_range = 0;
+  if (simd_lid == 0u) {
+    const uint group_start =
+        scale_projection_offset + uint(out_row) * uint(in_vec_size_g);
+    const uint tile = group_start >> 9;
+    exception_range = dsv4_scalex_load_u32(tile_prefix + 2u * tile);
+  }
+  exception_range = simd_shuffle(exception_range, ushort(0));
+  const uint exception_begin = exception_range & 0xffffu;
+  const uint exception_end = exception_range >> 16;
+
+  // Decode only this SIMD group's four output rows into a 512-byte local
+  // tile. Sparse exceptions are applied once before QMV instead of being
+  // rescanned for every dot-product scale lookup.
+  const uint group_start =
+      scale_projection_offset + uint(out_row) * uint(in_vec_size_g);
+  const uint group_scale_count =
+      uint(results_per_simdgroup * in_vec_size_g);
+  if (codec == 1u) {
+    const uint8_t palette0 = record[5];
+    const uint8_t palette1 = record[6];
+    for (uint local = simd_lid;
+         local < group_scale_count;
+         local += SIMD_SIZE) {
+      const uint raw_index = group_start + local;
+      const uint code =
+          (uint(primary[raw_index >> 3]) >> (raw_index & 7u)) & 1u;
+      local_scales[local] = code == 0u ? palette0 : palette1;
+    }
+  } else {
+    for (uint local = simd_lid;
+         local < group_scale_count;
+         local += SIMD_SIZE) {
+      local_scales[local] = dsv4_scalex_primary_value(
+          record, primary, codec, group_start + local);
+    }
+  }
+  for (uint index = exception_begin + simd_lid;
+       index < exception_end;
+       index += SIMD_SIZE) {
+    const uint position =
+        dsv4_scalex_load_u32(positions + ulong(index) * 4ul);
+    const uint local = position - group_start;
+    if (local < group_scale_count) {
+      local_scales[local] = exception_values[index];
+    }
+  }
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+
+  for (int k = 0; k < in_vec_size; k += block_size) {
+    load_vector<T, U, values_per_thread>(x, x_thread);
+    const uint scale_group =
+        uint(simd_lid / scale_step_per_thread + k / group_size);
+
+    for (int row = 0; row < results_per_simdgroup; ++row) {
+      const device uint8_t* wl = ws + row * in_vec_size_w;
+      const uint8_t encoded_scale =
+          local_scales[uint(row) * uint(in_vec_size_g) + scale_group];
+      const U scale = dequantize_scale<U, group_size>(encoded_scale);
+      result[row] +=
+          qdot<U, values_per_thread, bits>(wl, x_thread, scale);
+    }
+
+    ws += block_size * bytes_per_pack / pack_factor;
+    x += block_size;
+  }
+
+  for (int row = 0; row < results_per_simdgroup; ++row) {
+    result[row] = simd_sum(result[row]);
+    if (simd_lid == 0u) {
+      y[row] = static_cast<T>(result[row]);
+    }
+  }
+}
+
 [[kernel]] void dsv4_mxfp4_pair_bf16(
     const device uint32_t* up_weight [[buffer(0)]],
     const device uint8_t* up_scales [[buffer(1)]],
@@ -93,6 +247,56 @@
       weight + ulong(slot) * weight_stride,
       scales + ulong(slot) * scale_stride,
       x + ulong(route_position) * ulong(in_vec_size),
+      output + ulong(route_position) * ulong(out_vec_size),
+      in_vec_size,
+      out_vec_size,
+      qmv_tid,
+      simd_gid,
+      simd_lid);
+}
+
+[[kernel]] void dsv4_scalex_mxfp4_qmv_bf16(
+    const device uint32_t* weight [[buffer(0)]],
+    const device uint8_t* scale_records [[buffer(1)]],
+    const device bfloat16_t* x [[buffer(2)]],
+    const device uint32_t* routes [[buffer(3)]],
+    device bfloat16_t* output [[buffer(4)]],
+    const constant int& in_vec_size [[buffer(5)]],
+    const constant int& out_vec_size [[buffer(6)]],
+    const constant int& record_stride [[buffer(7)]],
+    const constant uint& projection [[buffer(8)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  threadgroup uint8_t scale_tile[1024];
+  const uint route_position = tid.z;
+  const uint slot = routes[route_position];
+  if (slot == 0xffffffffu) {
+    if (simd_lid < 4u) {
+      const uint row = tid.y * 8u + simd_gid * 4u + simd_lid;
+      if (row < uint(out_vec_size)) {
+        output[ulong(route_position) * ulong(out_vec_size) + row] =
+            bfloat16_t(0.0f);
+      }
+    }
+    return;
+  }
+  const ulong weight_stride =
+      ulong(out_vec_size) * ulong(in_vec_size / 8);
+  const uint scale_count = uint(out_vec_size * (in_vec_size / 32));
+  const device uint8_t* record =
+      scale_records + ulong(slot) * ulong(record_stride);
+  const device bfloat16_t* route_x =
+      projection == 1u
+      ? x + ulong(route_position) * ulong(in_vec_size)
+      : x;
+  const uint3 qmv_tid(0u, tid.y, 0u);
+  dsv4_scalex_qmv_fast_impl<bfloat16_t, 32, 4>(
+      weight + ulong(slot) * weight_stride,
+      record,
+      scale_tile + simd_gid * 512u,
+      projection * scale_count,
+      route_x,
       output + ulong(route_position) * ulong(out_vec_size),
       in_vec_size,
       out_vec_size,

@@ -93,6 +93,79 @@ uint32_t read_u32_le(const unsigned char* source) {
       (static_cast<uint32_t>(source[3]) << 24);
 }
 
+constexpr size_t kScaleXTileScales = 512;
+
+size_t align_scalex_prefix(size_t encoded_nbytes) {
+  return (encoded_nbytes + 1) & ~size_t{1};
+}
+
+size_t scalex_indexed_nbytes(size_t encoded_nbytes, size_t raw_nbytes) {
+  const size_t tile_count =
+      (raw_nbytes + kScaleXTileScales - 1) / kScaleXTileScales;
+  if (tile_count >= std::numeric_limits<size_t>::max() / 2) {
+    throw std::overflow_error("[ScaleXModeADirect] tile index is too large");
+  }
+  return align_scalex_prefix(encoded_nbytes) + 2 * (tile_count + 1);
+}
+
+void write_u16_le(unsigned char* destination, uint16_t value) {
+  destination[0] = static_cast<unsigned char>(value);
+  destination[1] = static_cast<unsigned char>(value >> 8);
+}
+
+void build_scalex_tile_prefix(
+    char* record_destination,
+    size_t encoded_nbytes,
+    size_t destination_nbytes,
+    size_t expected_raw_nbytes) {
+  const auto* encoded =
+      reinterpret_cast<const unsigned char*>(record_destination);
+  if (encoded_nbytes < 24 || std::memcmp(encoded, "LSA1", 4) != 0) {
+    throw std::runtime_error("[ScaleXModeADirect] invalid Mode-B record");
+  }
+  const size_t raw_nbytes = read_u32_le(encoded + 12);
+  const size_t primary_nbytes = read_u32_le(encoded + 16);
+  const size_t exception_count = read_u32_le(encoded + 20);
+  if (raw_nbytes != expected_raw_nbytes ||
+      exception_count > std::numeric_limits<uint16_t>::max() ||
+      exception_count >
+          (std::numeric_limits<size_t>::max() - 24 - primary_nbytes) / 5 ||
+      24 + primary_nbytes + 5 * exception_count != encoded_nbytes ||
+      scalex_indexed_nbytes(encoded_nbytes, raw_nbytes) > destination_nbytes) {
+    throw std::runtime_error(
+        "[ScaleXModeADirect] invalid Mode-B record geometry");
+  }
+
+  const auto* positions = encoded + 24 + primary_nbytes;
+  auto* prefix = reinterpret_cast<unsigned char*>(record_destination) +
+      align_scalex_prefix(encoded_nbytes);
+  const size_t tile_count =
+      (raw_nbytes + kScaleXTileScales - 1) / kScaleXTileScales;
+  size_t exception = 0;
+  uint32_t previous = 0;
+  for (size_t tile = 0; tile <= tile_count; ++tile) {
+    const size_t boundary = std::min(tile * kScaleXTileScales, raw_nbytes);
+    while (exception < exception_count) {
+      const uint32_t position = read_u32_le(positions + 4 * exception);
+      if (position >= raw_nbytes ||
+          (exception != 0 && position <= previous)) {
+        throw std::runtime_error(
+            "[ScaleXModeADirect] invalid Mode-B exception position");
+      }
+      if (position >= boundary) {
+        break;
+      }
+      previous = position;
+      ++exception;
+    }
+    write_u16_le(prefix + 2 * tile, static_cast<uint16_t>(exception));
+  }
+  if (exception != exception_count) {
+    throw std::runtime_error(
+        "[ScaleXModeADirect] Mode-B prefix did not consume exceptions");
+  }
+}
+
 std::vector<unsigned char>& scalex_encoded_scratch(size_t nbytes) {
   // Expert refills run on a bounded native worker pool. Retaining one grow-only
   // buffer per worker avoids tens of thousands of allocator round trips while
@@ -560,6 +633,104 @@ void ScaleXModeADirect::load_expert_into(
   decode_scalex_mode_a_into(
       encoded, scale_destinations, scale_destination_nbytes);
 #endif
+}
+
+void ScaleXModeADirect::load_compressed_expert_into(
+    size_t expert_id,
+    char* record_destination,
+    size_t record_destination_nbytes,
+    const std::array<char*, 3>& weight_destinations,
+    const std::array<size_t, 3>& weight_destination_nbytes) const {
+#ifdef _WIN32
+  throw std::runtime_error(
+      "[ScaleXModeADirect] compressed expert reads require POSIX preadv");
+#else
+  if (expert_id >= records_.size()) {
+    throw std::out_of_range("[ScaleXModeADirect] expert id is out of range");
+  }
+  const auto& record = records_[expert_id];
+  const size_t raw_nbytes = std::accumulate(
+      decoded_tensor_nbytes_.begin(), decoded_tensor_nbytes_.end(), size_t{0});
+  if (record_destination == nullptr ||
+      record_destination_nbytes <
+          scalex_indexed_nbytes(record.encoded_nbytes, raw_nbytes) ||
+      std::any_of(
+          weight_destinations.begin(), weight_destinations.end(), [](char* value) {
+            return value == nullptr;
+          }) ||
+      std::any_of(
+          weight_destination_nbytes.begin(),
+          weight_destination_nbytes.end(),
+          [](size_t value) { return value == 0; })) {
+    throw std::invalid_argument(
+        "[ScaleXModeADirect] compressed destination tensor layout mismatch");
+  }
+  const size_t weight_bytes = std::accumulate(
+      weight_destination_nbytes.begin(),
+      weight_destination_nbytes.end(),
+      size_t{0});
+  if (record.absolute_offset > file_nbytes_ ||
+      record.encoded_nbytes > file_nbytes_ - record.absolute_offset ||
+      weight_bytes >
+          file_nbytes_ - record.absolute_offset - record.encoded_nbytes) {
+    throw std::runtime_error(
+        "[ScaleXModeADirect] compressed expert range exceeds file bounds");
+  }
+
+  std::array<struct iovec, 4> vectors{};
+  vectors[0].iov_base = record_destination;
+  vectors[0].iov_len = record.encoded_nbytes;
+  for (size_t tensor = 0; tensor < weight_destinations.size(); ++tensor) {
+    vectors[tensor + 1].iov_base = weight_destinations[tensor];
+    vectors[tensor + 1].iov_len = weight_destination_nbytes[tensor];
+  }
+  const size_t total_bytes = record.encoded_nbytes + weight_bytes;
+  ssize_t result;
+  do {
+    result = ::preadv(
+        fd_,
+        vectors.data(),
+        static_cast<int>(vectors.size()),
+        static_cast<off_t>(record.absolute_offset));
+  } while (result < 0 && errno == EINTR);
+  if (result != static_cast<ssize_t>(total_bytes)) {
+    pread_exact(
+        fd_,
+        record_destination,
+        record.encoded_nbytes,
+        record.absolute_offset);
+    size_t offset = record.absolute_offset + record.encoded_nbytes;
+    for (size_t tensor = 0; tensor < weight_destinations.size(); ++tensor) {
+      pread_exact(
+          fd_,
+          weight_destinations[tensor],
+          weight_destination_nbytes[tensor],
+          offset);
+      offset += weight_destination_nbytes[tensor];
+    }
+  }
+  build_scalex_tile_prefix(
+      record_destination,
+      record.encoded_nbytes,
+      record_destination_nbytes,
+      raw_nbytes);
+#endif
+}
+
+size_t ScaleXModeADirect::maximum_encoded_nbytes() const {
+  return std::max_element(
+             records_.begin(),
+             records_.end(),
+             [](const auto& left, const auto& right) {
+               return left.encoded_nbytes < right.encoded_nbytes;
+             })
+      ->encoded_nbytes;
+}
+
+size_t ScaleXModeADirect::maximum_indexed_nbytes() const {
+  const size_t raw_nbytes = std::accumulate(
+      decoded_tensor_nbytes_.begin(), decoded_tensor_nbytes_.end(), size_t{0});
+  return scalex_indexed_nbytes(maximum_encoded_nbytes(), raw_nbytes);
 }
 
 SafetensorsRowDirect::SafetensorsRowDirect(

@@ -69,4 +69,16 @@ MLX_API array expert_ssd_mxfp4_masked_qmv(
     const array& routes,
     StreamOrDevice s = {});
 
+// Mode B consumes each complete lossless ScaleX record directly from its
+// resident row. The three logical scale tensors are never hydrated. This
+// single-projection primitive preserves the stock gather_qmm graph shape.
+// projection follows physical ScaleX order: gate=0, down=1, up=2.
+MLX_API array expert_ssd_scalex_mxfp4_qmv(
+    const array& x,
+    const array& weight,
+    const array& scale_records,
+    const array& routes,
+    uint32_t projection,
+    StreamOrDevice s = {});
+
 } // namespace mlx::core

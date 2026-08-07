@@ -177,6 +177,55 @@ class ExpertSSDMXFP4MaskedQMV : public Primitive {
   DEFINE_NAME(ExpertSSDMXFP4MaskedQMV)
 };
 
+class ExpertSSDScaleXMXFP4QMV : public Primitive {
+ public:
+  ExpertSSDScaleXMXFP4QMV(Stream stream, uint32_t projection)
+      : Primitive(stream), projection_(projection) {}
+
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+    throw std::runtime_error(
+        "[ExpertSSDScaleXMXFP4QMV] CPU evaluation not supported");
+  }
+
+  void eval_gpu(
+      const std::vector<array>& inputs,
+      std::vector<array>& outputs) override {
+    if (inputs.size() != 4 || outputs.size() != 1) {
+      throw std::runtime_error(
+          "[ExpertSSDScaleXMXFP4QMV] invalid input/output arity");
+    }
+    auto& output = outputs[0];
+    output.set_data(allocator::malloc(output.nbytes()));
+    const auto& x = inputs[0];
+    const auto& weight = inputs[1];
+    const auto& scale_records = inputs[2];
+    const auto& routes = inputs[3];
+    const int K = x.shape(-1);
+    const int N = weight.shape(-2);
+    const int record_stride = scale_records.shape(-1);
+    auto& d = metal::device(stream().device);
+    auto* kernel = d.get_kernel("dsv4_scalex_mxfp4_qmv_bf16");
+    auto& encoder = metal::get_command_encoder(stream());
+    encoder.set_compute_pipeline_state(kernel);
+    encoder.set_input_array(weight, 0);
+    encoder.set_input_array(scale_records, 1);
+    encoder.set_input_array(x, 2);
+    encoder.set_input_array(routes, 3);
+    encoder.set_output_array(output, 4);
+    encoder.set_bytes(K, 5);
+    encoder.set_bytes(N, 6);
+    encoder.set_bytes(record_stride, 7);
+    encoder.set_bytes(projection_, 8);
+    encoder.dispatch_threadgroups(
+        MTL::Size(1, N / 8, routes.size()), MTL::Size(32, 2, 1));
+  }
+
+  DEFINE_NAME(ExpertSSDScaleXMXFP4QMV)
+
+ private:
+  uint32_t projection_;
+};
+
 } // namespace
 
 std::shared_ptr<ExpertSSDIoEventState> expert_ssd_io_event_state_new() {
@@ -347,6 +396,50 @@ array expert_ssd_mxfp4_masked_qmv(
       {bfloat16},
       primitive,
       {x, weight, scales, routes})[0];
+}
+
+array expert_ssd_scalex_mxfp4_qmv(
+    const array& x,
+    const array& weight,
+    const array& scale_records,
+    const array& routes,
+    uint32_t projection,
+    StreamOrDevice s) {
+  if (x.dtype() != bfloat16 || weight.dtype() != uint32 ||
+      scale_records.dtype() != uint8 ||
+      (routes.dtype() != uint32 && routes.dtype() != int32) ||
+      projection > 2) {
+    throw std::invalid_argument(
+        "[expert_ssd_scalex_mxfp4_qmv] incompatible dtype or projection");
+  }
+  const bool input_rows_match =
+      projection == 1 ? x.size() == routes.size() * x.shape(-1)
+                      : x.size() == x.shape(-1);
+  if (x.ndim() < 2 || x.shape(-2) != 1 || !input_rows_match ||
+      routes.ndim() != 1 ||
+      routes.size() == 0 || weight.ndim() != 3 ||
+      scale_records.ndim() != 2 ||
+      weight.shape(0) != scale_records.shape(0)) {
+    throw std::invalid_argument(
+        "[expert_ssd_scalex_mxfp4_qmv] invalid fixed-decode geometry");
+  }
+  const int K = x.shape(-1);
+  const int N = weight.shape(-2);
+  const bool expected_geometry =
+      (projection == 1 && K == 2048 && N == 4096) ||
+      (projection != 1 && K == 4096 && N == 2048);
+  if (!expected_geometry || weight.shape(-1) * 8 != K) {
+    throw std::invalid_argument(
+        "[expert_ssd_scalex_mxfp4_qmv] unsupported target geometry");
+  }
+  Shape output_shape{static_cast<ShapeElem>(routes.size()), 1, N};
+  auto primitive = std::make_shared<ExpertSSDScaleXMXFP4QMV>(
+      to_stream(s, Device::gpu), projection);
+  return array::make_arrays(
+      {output_shape},
+      {bfloat16},
+      primitive,
+      {x, weight, scale_records, routes})[0];
 }
 
 } // namespace mlx::core
