@@ -443,6 +443,7 @@ nb::tuple official_direct_route_plan(mx::array indices) {
 
 void init_ops(nb::module_& m) {
   nb::class_<mx::ExpertSafetensorsDirect>(m, "_ExpertSafetensorsDirect");
+  nb::class_<mx::ScaleXPrefixStore>(m, "_ScaleXPrefixStore");
   nb::class_<mx::ScaleXModeADirect>(m, "_ScaleXModeADirect");
   nb::class_<mx::SafetensorsRowDirect>(m, "_SafetensorsRowDirect");
   nb::class_<mx::ExpertSSDIoEventState>(m, "_ExpertSSDIoEventState");
@@ -666,12 +667,35 @@ void init_ops(nb::module_& m) {
         positioned scatter reads; no converted slab is required.
       )pbdoc");
   m.def(
+      "_open_scalex_prefix_store",
+      [](nb::object file,
+         size_t data_offset,
+         size_t layers,
+         size_t experts_per_layer,
+         size_t prefix_nbytes) {
+        return std::make_shared<mx::ScaleXPrefixStore>(
+            nb::cast<std::string>(nb::str(file)),
+            data_offset,
+            layers,
+            experts_per_layer,
+            prefix_nbytes);
+      },
+      "file"_a,
+      "data_offset"_a,
+      "layers"_a,
+      "experts_per_layer"_a,
+      "prefix_nbytes"_a,
+      nb::sig(
+          "def _open_scalex_prefix_store(file: Union[str, pathlib.Path], data_offset: int, layers: int, experts_per_layer: int, prefix_nbytes: int) -> _ScaleXPrefixStore"));
+  m.def(
       "_open_scalex_mode_a_direct",
       [](nb::object file,
          const std::vector<std::pair<size_t, size_t>>& raw_records,
          const std::vector<size_t>& decoded_tensor_nbytes,
          bool no_cache,
-         bool read_ahead) {
+         bool read_ahead,
+         std::shared_ptr<mx::ScaleXPrefixStore> prefix_store,
+         size_t prefix_layer) {
         if (raw_records.empty() || decoded_tensor_nbytes.size() != 3) {
           throw std::invalid_argument(
               "[_open_scalex_mode_a_direct] expected records and three tensor sizes");
@@ -690,15 +714,38 @@ void init_ops(nb::module_& m) {
             std::move(records),
             tensor_nbytes,
             no_cache,
-            read_ahead);
+            read_ahead,
+            std::move(prefix_store),
+            prefix_layer);
       },
       "file"_a,
       "records"_a,
       "decoded_tensor_nbytes"_a,
       "no_cache"_a = false,
       "read_ahead"_a = true,
+      "prefix_store"_a = nullptr,
+      "prefix_layer"_a = 0,
       nb::sig(
-          "def _open_scalex_mode_a_direct(file: Union[str, pathlib.Path], records: list[tuple[int, int]], decoded_tensor_nbytes: list[int], no_cache: bool = False, read_ahead: bool = True) -> _ScaleXModeADirect"));
+          "def _open_scalex_mode_a_direct(file: Union[str, pathlib.Path], records: list[tuple[int, int]], decoded_tensor_nbytes: list[int], no_cache: bool = False, read_ahead: bool = True, prefix_store: Optional[_ScaleXPrefixStore] = None, prefix_layer: int = 0) -> _ScaleXModeADirect"));
+  m.def(
+      "_scalex_mode_a_prefix_stats",
+      [](std::shared_ptr<mx::ScaleXModeADirect> direct) {
+        if (!direct) {
+          throw std::invalid_argument(
+              "[_scalex_mode_a_prefix_stats] invalid handle");
+        }
+        const auto stats = direct->prefix_stats();
+        nb::dict result;
+        result["persisted"] = stats.persisted;
+        result["prepare_calls"] = stats.prepare_calls;
+        result["prepare_nanoseconds"] = stats.prepare_nanoseconds;
+        result["store_bytes"] = stats.store_bytes;
+        result["store_load_nanoseconds"] = stats.store_load_nanoseconds;
+        return result;
+      },
+      "direct"_a,
+      nb::sig(
+          "def _scalex_mode_a_prefix_stats(direct: _ScaleXModeADirect) -> dict"));
   m.def(
       "_open_safetensors_row_direct",
       [](nb::object file,

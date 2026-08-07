@@ -2,7 +2,9 @@
 
 #pragma once
 
+#include <atomic>
 #include <array>
+#include <memory>
 #include <unordered_map>
 #include <variant>
 
@@ -84,6 +86,54 @@ struct ScaleXModeARecordSpec {
   size_t encoded_nbytes;
 };
 
+/** One process-lifetime, checksummed ScaleX prefix payload.
+ *
+ * The Python side validates the sidecar header, checkpoint identity and
+ * payload SHA-256 before opening this store.  Native code reads the complete
+ * fixed-width payload once and shares it across all per-layer direct readers.
+ */
+class MLX_API ScaleXPrefixStore {
+ public:
+  ScaleXPrefixStore(
+      std::string file,
+      size_t data_offset,
+      size_t layers,
+      size_t experts_per_layer,
+      size_t prefix_nbytes);
+
+  const unsigned char* prefix(size_t layer, size_t expert) const;
+  size_t layers() const {
+    return layers_;
+  }
+  size_t experts_per_layer() const {
+    return experts_per_layer_;
+  }
+  size_t prefix_nbytes() const {
+    return prefix_nbytes_;
+  }
+  size_t payload_nbytes() const {
+    return payload_.size();
+  }
+  uint64_t load_nanoseconds() const {
+    return load_nanoseconds_;
+  }
+
+ private:
+  size_t layers_{0};
+  size_t experts_per_layer_{0};
+  size_t prefix_nbytes_{0};
+  uint64_t load_nanoseconds_{0};
+  std::vector<unsigned char> payload_;
+};
+
+struct ScaleXPrefixStats {
+  bool persisted{false};
+  size_t prepare_calls{0};
+  uint64_t prepare_nanoseconds{0};
+  size_t store_bytes{0};
+  uint64_t store_load_nanoseconds{0};
+};
+
 /**
  * Decode-on-arrival reader for the three E8M0 scale tensors of one expert.
  *
@@ -97,7 +147,9 @@ class MLX_API ScaleXModeADirect {
       std::vector<ScaleXModeARecordSpec> records,
       std::array<size_t, 3> decoded_tensor_nbytes,
       bool no_cache = false,
-      bool read_ahead = true);
+      bool read_ahead = true,
+      std::shared_ptr<ScaleXPrefixStore> prefix_store = nullptr,
+      size_t prefix_layer = 0);
   ~ScaleXModeADirect();
 
   ScaleXModeADirect(const ScaleXModeADirect&) = delete;
@@ -132,9 +184,10 @@ class MLX_API ScaleXModeADirect {
   }
   size_t maximum_encoded_nbytes() const;
   // Mode-B rows append one uint16 exception prefix for every 512-scale tile,
-  // plus the terminal prefix. The index is built after the on-disk record
-  // lands and is never persisted in the checkpoint.
+  // plus the terminal prefix. It is copied from a process-lifetime sidecar
+  // when available, otherwise built after the on-disk record lands.
   size_t maximum_indexed_nbytes() const;
+  ScaleXPrefixStats prefix_stats() const;
 
  private:
   std::string file_;
@@ -142,6 +195,10 @@ class MLX_API ScaleXModeADirect {
   int fd_{-1};
   std::vector<ScaleXModeARecordSpec> records_;
   std::array<size_t, 3> decoded_tensor_nbytes_{};
+  std::shared_ptr<ScaleXPrefixStore> prefix_store_;
+  size_t prefix_layer_{0};
+  mutable std::atomic<size_t> prefix_prepare_calls_{0};
+  mutable std::atomic<uint64_t> prefix_prepare_nanoseconds_{0};
 };
 
 /** Positioned row reader for a two-dimensional official safetensors tensor. */

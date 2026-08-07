@@ -3,6 +3,7 @@
 #include <json.hpp>
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <fcntl.h>
 #include <limits>
@@ -342,6 +343,72 @@ void decode_scalex_mode_a_into(
 
 } // namespace
 
+ScaleXPrefixStore::ScaleXPrefixStore(
+    std::string file,
+    size_t data_offset,
+    size_t layers,
+    size_t experts_per_layer,
+    size_t prefix_nbytes)
+    : layers_(layers),
+      experts_per_layer_(experts_per_layer),
+      prefix_nbytes_(prefix_nbytes) {
+#ifdef _WIN32
+  throw std::runtime_error(
+      "[ScaleXPrefixStore] persisted prefixes require POSIX pread");
+#else
+  if (layers_ == 0 || experts_per_layer_ == 0 || prefix_nbytes_ == 0 ||
+      prefix_nbytes_ % 2 != 0 ||
+      layers_ > std::numeric_limits<size_t>::max() / experts_per_layer_ ||
+      layers_ * experts_per_layer_ >
+          std::numeric_limits<size_t>::max() / prefix_nbytes_) {
+    throw std::invalid_argument(
+        "[ScaleXPrefixStore] invalid or overflowing prefix geometry");
+  }
+  const size_t payload_nbytes =
+      layers_ * experts_per_layer_ * prefix_nbytes_;
+  const int fd = ::open(file.c_str(), O_RDONLY);
+  if (fd < 0) {
+    throw std::runtime_error(
+        "[ScaleXPrefixStore] failed to open prefix map " + file);
+  }
+  try {
+    struct stat info {};
+    if (::fstat(fd, &info) != 0 || info.st_size < 0 ||
+        data_offset > static_cast<size_t>(info.st_size) ||
+        payload_nbytes > static_cast<size_t>(info.st_size) - data_offset) {
+      throw std::invalid_argument(
+          "[ScaleXPrefixStore] prefix payload exceeds file bounds");
+    }
+    payload_.resize(payload_nbytes);
+    const auto started = std::chrono::steady_clock::now();
+    pread_exact(
+        fd,
+        reinterpret_cast<char*>(payload_.data()),
+        payload_.size(),
+        data_offset);
+    load_nanoseconds_ = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started)
+            .count());
+  } catch (...) {
+    ::close(fd);
+    throw;
+  }
+  ::close(fd);
+#endif
+}
+
+const unsigned char* ScaleXPrefixStore::prefix(
+    size_t layer,
+    size_t expert) const {
+  if (layer >= layers_ || expert >= experts_per_layer_) {
+    throw std::out_of_range(
+        "[ScaleXPrefixStore] layer or expert is out of range");
+  }
+  const size_t index = layer * experts_per_layer_ + expert;
+  return payload_.data() + index * prefix_nbytes_;
+}
+
 ExpertSafetensorsDirect::ExpertSafetensorsDirect(
     std::string file,
     std::vector<std::vector<SafetensorsTensorSpec>> specs_by_expert,
@@ -462,10 +529,14 @@ ScaleXModeADirect::ScaleXModeADirect(
     std::vector<ScaleXModeARecordSpec> records,
     std::array<size_t, 3> decoded_tensor_nbytes,
     bool no_cache,
-    bool read_ahead)
+    bool read_ahead,
+    std::shared_ptr<ScaleXPrefixStore> prefix_store,
+    size_t prefix_layer)
     : file_(std::move(file)),
       records_(std::move(records)),
-      decoded_tensor_nbytes_(decoded_tensor_nbytes) {
+      decoded_tensor_nbytes_(decoded_tensor_nbytes),
+      prefix_store_(std::move(prefix_store)),
+      prefix_layer_(prefix_layer) {
 #ifdef _WIN32
   throw std::runtime_error(
       "[ScaleXModeADirect] decode-on-arrival requires POSIX pread");
@@ -512,6 +583,21 @@ ScaleXModeADirect::ScaleXModeADirect(
       fd_ = -1;
       throw std::invalid_argument(
           "[ScaleXModeADirect] encoded record exceeds file bounds");
+    }
+  }
+  if (prefix_store_) {
+    const size_t raw_nbytes = std::accumulate(
+        decoded_tensor_nbytes_.begin(), decoded_tensor_nbytes_.end(), size_t{0});
+    const size_t tile_count =
+        (raw_nbytes + kScaleXTileScales - 1) / kScaleXTileScales;
+    const size_t expected_prefix_nbytes = 2 * (tile_count + 1);
+    if (prefix_layer_ >= prefix_store_->layers() ||
+        records_.size() != prefix_store_->experts_per_layer() ||
+        expected_prefix_nbytes != prefix_store_->prefix_nbytes()) {
+      ::close(fd_);
+      fd_ = -1;
+      throw std::invalid_argument(
+          "[ScaleXModeADirect] persisted prefix geometry mismatch");
     }
   }
 #endif
@@ -709,11 +795,30 @@ void ScaleXModeADirect::load_compressed_expert_into(
       offset += weight_destination_nbytes[tensor];
     }
   }
-  build_scalex_tile_prefix(
-      record_destination,
-      record.encoded_nbytes,
-      record_destination_nbytes,
-      raw_nbytes);
+  const auto prefix_started = std::chrono::steady_clock::now();
+  if (prefix_store_) {
+    const size_t prefix_offset = align_scalex_prefix(record.encoded_nbytes);
+    if (record.encoded_nbytes != prefix_offset) {
+      record_destination[record.encoded_nbytes] = 0;
+    }
+    std::memcpy(
+        record_destination + prefix_offset,
+        prefix_store_->prefix(prefix_layer_, expert_id),
+        prefix_store_->prefix_nbytes());
+  } else {
+    build_scalex_tile_prefix(
+        record_destination,
+        record.encoded_nbytes,
+        record_destination_nbytes,
+        raw_nbytes);
+  }
+  const auto prefix_elapsed = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - prefix_started)
+          .count());
+  prefix_prepare_nanoseconds_.fetch_add(
+      prefix_elapsed, std::memory_order_relaxed);
+  prefix_prepare_calls_.fetch_add(1, std::memory_order_relaxed);
 #endif
 }
 
@@ -731,6 +836,15 @@ size_t ScaleXModeADirect::maximum_indexed_nbytes() const {
   const size_t raw_nbytes = std::accumulate(
       decoded_tensor_nbytes_.begin(), decoded_tensor_nbytes_.end(), size_t{0});
   return scalex_indexed_nbytes(maximum_encoded_nbytes(), raw_nbytes);
+}
+
+ScaleXPrefixStats ScaleXModeADirect::prefix_stats() const {
+  return ScaleXPrefixStats{
+      prefix_store_ != nullptr,
+      prefix_prepare_calls_.load(std::memory_order_relaxed),
+      prefix_prepare_nanoseconds_.load(std::memory_order_relaxed),
+      prefix_store_ ? prefix_store_->payload_nbytes() : size_t{0},
+      prefix_store_ ? prefix_store_->load_nanoseconds() : uint64_t{0}};
 }
 
 SafetensorsRowDirect::SafetensorsRowDirect(
