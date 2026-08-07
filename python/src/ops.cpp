@@ -584,6 +584,23 @@ void init_ops(nb::module_& m) {
       nb::sig(
           "def _expert_ssd_mxfp4_masked_qmv(x: array, weight: array, scales: array, routes: array) -> array"));
   m.def(
+      "_expert_ssd_scalex_mxfp4_qmv",
+      [](const mx::array& x,
+         const mx::array& weight,
+         const mx::array& scale_records,
+         const mx::array& routes,
+         uint32_t projection) {
+        return mx::expert_ssd_scalex_mxfp4_qmv(
+            x, weight, scale_records, routes, projection);
+      },
+      "x"_a,
+      "weight"_a,
+      "scale_records"_a,
+      "routes"_a,
+      "projection"_a,
+      nb::sig(
+          "def _expert_ssd_scalex_mxfp4_qmv(x: array, weight: array, scale_records: array, routes: array, projection: int) -> array"));
+  m.def(
       "_expert_ssd_route_plan",
       &official_direct_route_plan,
       "indices"_a,
@@ -943,6 +960,70 @@ void init_ops(nb::module_& m) {
       "weight_destinations"_a,
       nb::sig(
           "def _scalex_mode_a_load_experts_into_many(direct: _ScaleXModeADirect, expert_ids: list[int], slots: list[int], scale_destinations: list[array], weight_destinations: list[array]) -> None"));
+  m.def(
+      "_scalex_mode_b_load_experts_into_many",
+      [](std::shared_ptr<mx::ScaleXModeADirect> direct,
+         const std::vector<size_t>& expert_ids,
+         const std::vector<size_t>& slots,
+         mx::array record_destinations,
+         std::vector<mx::array> weight_destinations) {
+        if (!direct || expert_ids.size() != slots.size() ||
+            record_destinations.ndim() != 2 ||
+            record_destinations.dtype() != mx::uint8) {
+          throw std::invalid_argument(
+              "[_scalex_mode_b_load_experts_into_many] invalid handle, rows, or record destination");
+        }
+        if (!record_destinations.is_available()) {
+          record_destinations.eval();
+        }
+        if (!record_destinations.flags().row_contiguous) {
+          throw std::invalid_argument(
+              "[_scalex_mode_b_load_experts_into_many] record destination must be row-contiguous");
+        }
+        const size_t capacity =
+            static_cast<size_t>(record_destinations.shape(0));
+        const size_t record_row_nbytes =
+            record_destinations.nbytes() / capacity;
+        if (capacity == 0 ||
+            record_row_nbytes < direct->maximum_encoded_nbytes()) {
+          throw std::invalid_argument(
+              "[_scalex_mode_b_load_experts_into_many] compressed record row is too small");
+        }
+        const auto weights = validate_scalex_destinations(
+            weight_destinations, mx::uint32);
+        if (weights.capacity != capacity) {
+          throw std::invalid_argument(
+              "[_scalex_mode_b_load_experts_into_many] record/weight capacities differ");
+        }
+        for (auto slot : slots) {
+          if (slot >= capacity) {
+            throw std::out_of_range(
+                "[_scalex_mode_b_load_experts_into_many] destination slot is out of range");
+          }
+        }
+        nb::gil_scoped_release release;
+        auto* record_base = record_destinations.data<char>();
+        std::array<char*, 3> weight_pointers{};
+        for (size_t item = 0; item < expert_ids.size(); ++item) {
+          for (size_t tensor = 0; tensor < 3; ++tensor) {
+            weight_pointers[tensor] = weights.bases[tensor] +
+                slots[item] * weights.row_nbytes[tensor];
+          }
+          direct->load_compressed_expert_into(
+              expert_ids[item],
+              record_base + slots[item] * record_row_nbytes,
+              record_row_nbytes,
+              weight_pointers,
+              weights.row_nbytes);
+        }
+      },
+      "direct"_a,
+      "expert_ids"_a,
+      "slots"_a,
+      "record_destinations"_a,
+      "weight_destinations"_a,
+      nb::sig(
+          "def _scalex_mode_b_load_experts_into_many(direct: _ScaleXModeADirect, expert_ids: list[int], slots: list[int], record_destinations: array, weight_destinations: list[array]) -> None"));
   m.def(
       "_expert_ssd_copy_rows",
       [](std::vector<mx::array> sources,

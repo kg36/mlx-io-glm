@@ -115,12 +115,22 @@ class MLX_API ScaleXModeADirect {
       const std::array<char*, 3>& weight_destinations,
       const std::array<size_t, 3>& weight_destination_nbytes) const;
 
+  // Mode B retains the encoded record in its final cache row and lets the
+  // Metal QMV consume it directly. No decoded scale destination is allocated.
+  void load_compressed_expert_into(
+      size_t expert_id,
+      char* record_destination,
+      size_t record_destination_nbytes,
+      const std::array<char*, 3>& weight_destinations,
+      const std::array<size_t, 3>& weight_destination_nbytes) const;
+
   size_t num_experts() const {
     return records_.size();
   }
   const std::array<size_t, 3>& decoded_tensor_nbytes() const {
     return decoded_tensor_nbytes_;
   }
+  size_t maximum_encoded_nbytes() const;
 
  private:
   std::string file_;

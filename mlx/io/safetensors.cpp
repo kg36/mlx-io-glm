@@ -562,6 +562,90 @@ void ScaleXModeADirect::load_expert_into(
 #endif
 }
 
+void ScaleXModeADirect::load_compressed_expert_into(
+    size_t expert_id,
+    char* record_destination,
+    size_t record_destination_nbytes,
+    const std::array<char*, 3>& weight_destinations,
+    const std::array<size_t, 3>& weight_destination_nbytes) const {
+#ifdef _WIN32
+  throw std::runtime_error(
+      "[ScaleXModeADirect] compressed expert reads require POSIX preadv");
+#else
+  if (expert_id >= records_.size()) {
+    throw std::out_of_range("[ScaleXModeADirect] expert id is out of range");
+  }
+  const auto& record = records_[expert_id];
+  if (record_destination == nullptr ||
+      record_destination_nbytes < record.encoded_nbytes ||
+      std::any_of(
+          weight_destinations.begin(), weight_destinations.end(), [](char* value) {
+            return value == nullptr;
+          }) ||
+      std::any_of(
+          weight_destination_nbytes.begin(),
+          weight_destination_nbytes.end(),
+          [](size_t value) { return value == 0; })) {
+    throw std::invalid_argument(
+        "[ScaleXModeADirect] compressed destination tensor layout mismatch");
+  }
+  const size_t weight_bytes = std::accumulate(
+      weight_destination_nbytes.begin(),
+      weight_destination_nbytes.end(),
+      size_t{0});
+  if (record.absolute_offset > file_nbytes_ ||
+      record.encoded_nbytes > file_nbytes_ - record.absolute_offset ||
+      weight_bytes >
+          file_nbytes_ - record.absolute_offset - record.encoded_nbytes) {
+    throw std::runtime_error(
+        "[ScaleXModeADirect] compressed expert range exceeds file bounds");
+  }
+
+  std::array<struct iovec, 4> vectors{};
+  vectors[0].iov_base = record_destination;
+  vectors[0].iov_len = record.encoded_nbytes;
+  for (size_t tensor = 0; tensor < weight_destinations.size(); ++tensor) {
+    vectors[tensor + 1].iov_base = weight_destinations[tensor];
+    vectors[tensor + 1].iov_len = weight_destination_nbytes[tensor];
+  }
+  const size_t total_bytes = record.encoded_nbytes + weight_bytes;
+  ssize_t result;
+  do {
+    result = ::preadv(
+        fd_,
+        vectors.data(),
+        static_cast<int>(vectors.size()),
+        static_cast<off_t>(record.absolute_offset));
+  } while (result < 0 && errno == EINTR);
+  if (result != static_cast<ssize_t>(total_bytes)) {
+    pread_exact(
+        fd_,
+        record_destination,
+        record.encoded_nbytes,
+        record.absolute_offset);
+    size_t offset = record.absolute_offset + record.encoded_nbytes;
+    for (size_t tensor = 0; tensor < weight_destinations.size(); ++tensor) {
+      pread_exact(
+          fd_,
+          weight_destinations[tensor],
+          weight_destination_nbytes[tensor],
+          offset);
+      offset += weight_destination_nbytes[tensor];
+    }
+  }
+#endif
+}
+
+size_t ScaleXModeADirect::maximum_encoded_nbytes() const {
+  return std::max_element(
+             records_.begin(),
+             records_.end(),
+             [](const auto& left, const auto& right) {
+               return left.encoded_nbytes < right.encoded_nbytes;
+             })
+      ->encoded_nbytes;
+}
+
 SafetensorsRowDirect::SafetensorsRowDirect(
     std::string file,
     Dtype dtype,
