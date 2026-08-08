@@ -305,6 +305,48 @@ METAL_FUNC void dsv4_scalex_qmv_fast_impl(
       simd_lid);
 }
 
+[[kernel]] void dsv4_scalex_mxfp4_qmv_split_bf16(
+    const device uint32_t* weight [[buffer(0)]],
+    const device uint8_t* scale_records [[buffer(1)]],
+    const device bfloat16_t* x [[buffer(2)]],
+    const device uint32_t* weight_routes [[buffer(3)]],
+    const device uint32_t* scale_routes [[buffer(4)]],
+    device bfloat16_t* output [[buffer(5)]],
+    const constant int& in_vec_size [[buffer(6)]],
+    const constant int& out_vec_size [[buffer(7)]],
+    const constant int& record_stride [[buffer(8)]],
+    const constant uint& projection [[buffer(9)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  threadgroup uint8_t scale_tile[1024];
+  const uint route_position = tid.z;
+  const uint weight_slot = weight_routes[route_position];
+  const uint scale_slot = scale_routes[route_position];
+  const ulong weight_stride =
+      ulong(out_vec_size) * ulong(in_vec_size / 8);
+  const uint scale_count = uint(out_vec_size * (in_vec_size / 32));
+  const device uint8_t* record =
+      scale_records + ulong(scale_slot) * ulong(record_stride);
+  const device bfloat16_t* route_x =
+      projection == 1u
+      ? x + ulong(route_position) * ulong(in_vec_size)
+      : x;
+  const uint3 qmv_tid(0u, tid.y, 0u);
+  dsv4_scalex_qmv_fast_impl<bfloat16_t, 32, 4>(
+      weight + ulong(weight_slot) * weight_stride,
+      record,
+      scale_tile + simd_gid * 512u,
+      projection * scale_count,
+      route_x,
+      output + ulong(route_position) * ulong(out_vec_size),
+      in_vec_size,
+      out_vec_size,
+      qmv_tid,
+      simd_gid,
+      simd_lid);
+}
+
 #define instantiate_quantized(mode, name, type, group_size, bits) \
   instantiate_kernel( \
       #mode "_" #name "_" #type "_gs_" #group_size "_b_" #bits, \

@@ -81,4 +81,16 @@ MLX_API array expert_ssd_scalex_mxfp4_qmv(
     uint32_t projection,
     StreamOrDevice s = {});
 
+// Coupled projection-cache variant. Down weights and their shared ScaleX
+// records may use different physical row ids while retaining one resident
+// expert set.
+MLX_API array expert_ssd_scalex_mxfp4_qmv_split_routes(
+    const array& x,
+    const array& weight,
+    const array& scale_records,
+    const array& weight_routes,
+    const array& scale_routes,
+    uint32_t projection,
+    StreamOrDevice s = {});
+
 } // namespace mlx::core
