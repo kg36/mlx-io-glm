@@ -176,6 +176,20 @@ class MLX_API ScaleXModeADirect {
       const std::array<char*, 3>& weight_destinations,
       const std::array<size_t, 3>& weight_destination_nbytes) const;
 
+  // Read one bounded portion of the same logical Mode-B expert record. The
+  // four physical destinations remain final cache rows; no staging copy is
+  // introduced. Returning short chunks lets a speculative caller yield to
+  // foreground demand between syscalls. The persisted ScaleX prefix is
+  // installed only when the final chunk lands.
+  size_t load_compressed_expert_chunk_into(
+      size_t expert_id,
+      size_t logical_offset,
+      size_t maximum_bytes,
+      char* record_destination,
+      size_t record_destination_nbytes,
+      const std::array<char*, 3>& weight_destinations,
+      const std::array<size_t, 3>& weight_destination_nbytes) const;
+
   size_t num_experts() const {
     return records_.size();
   }
@@ -188,11 +202,26 @@ class MLX_API ScaleXModeADirect {
   // when available, otherwise built after the on-disk record lands.
   size_t maximum_indexed_nbytes() const;
   ScaleXPrefixStats prefix_stats() const;
+  size_t advise_read(size_t expert_id, size_t total_bytes) const;
+  std::pair<size_t, size_t> page_residency(
+      size_t expert_id,
+      size_t total_bytes) const;
+
+  // Copy a Mode-B expert from this reader's persistent read-only mapping.
+  // The caller must first establish page residency; this method deliberately
+  // performs no positioned I/O and therefore cannot enter the SSD queue.
+  void copy_mapped_compressed_expert_into(
+      size_t expert_id,
+      char* record_destination,
+      size_t record_destination_nbytes,
+      const std::array<char*, 3>& weight_destinations,
+      const std::array<size_t, 3>& weight_destination_nbytes) const;
 
  private:
   std::string file_;
   size_t file_nbytes_{0};
   int fd_{-1};
+  void* file_mapping_{nullptr};
   std::vector<ScaleXModeARecordSpec> records_;
   std::array<size_t, 3> decoded_tensor_nbytes_{};
   std::shared_ptr<ScaleXPrefixStore> prefix_store_;

@@ -13,6 +13,7 @@
 #include <stack>
 
 #ifndef _WIN32
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -86,6 +87,84 @@ void pread_exact(int fd, char* destination, size_t nbytes, size_t offset) {
     completed += static_cast<size_t>(result);
   }
 }
+
+#ifdef __APPLE__
+std::pair<size_t, size_t> mapped_range_page_residency(
+    void* mapping,
+    size_t absolute_offset,
+    size_t byte_length) {
+  if (mapping == nullptr || byte_length == 0) {
+    return {0, 0};
+  }
+  const long raw_page_size = ::sysconf(_SC_PAGESIZE);
+  if (raw_page_size <= 0) {
+    throw std::runtime_error("[ScaleXModeADirect] invalid system page size");
+  }
+  const size_t page_size = static_cast<size_t>(raw_page_size);
+  const size_t aligned_offset = (absolute_offset / page_size) * page_size;
+  const size_t leading = absolute_offset - aligned_offset;
+  if (byte_length > std::numeric_limits<size_t>::max() - leading) {
+    throw std::overflow_error("[ScaleXModeADirect] residency range overflow");
+  }
+  const size_t mapped_bytes = leading + byte_length;
+  const size_t pages = (mapped_bytes + page_size - 1) / page_size;
+  const size_t mapped_length = pages * page_size;
+  std::vector<char> residency(pages, 0);
+  auto* address = static_cast<char*>(mapping) + aligned_offset;
+  if (::mincore(address, mapped_length, residency.data()) != 0) {
+    throw std::runtime_error("[ScaleXModeADirect] mincore failed");
+  }
+  const size_t resident = static_cast<size_t>(std::count_if(
+      residency.begin(), residency.end(), [](char value) {
+        return (static_cast<unsigned char>(value) & 1u) != 0;
+      }));
+  return {resident, pages};
+}
+
+std::pair<size_t, size_t> file_range_page_residency(
+    int fd,
+    size_t absolute_offset,
+    size_t byte_length) {
+  if (byte_length == 0) {
+    return {0, 0};
+  }
+  const long raw_page_size = ::sysconf(_SC_PAGESIZE);
+  if (raw_page_size <= 0) {
+    throw std::runtime_error("[ScaleXModeADirect] invalid system page size");
+  }
+  const size_t page_size = static_cast<size_t>(raw_page_size);
+  const size_t aligned_offset = (absolute_offset / page_size) * page_size;
+  const size_t leading = absolute_offset - aligned_offset;
+  if (byte_length > std::numeric_limits<size_t>::max() - leading) {
+    throw std::overflow_error("[ScaleXModeADirect] residency range overflow");
+  }
+  const size_t mapped_bytes = leading + byte_length;
+  const size_t pages = (mapped_bytes + page_size - 1) / page_size;
+  if (pages > std::numeric_limits<size_t>::max() / page_size) {
+    throw std::overflow_error("[ScaleXModeADirect] residency mapping overflow");
+  }
+  const size_t mapped_length = pages * page_size;
+  void* mapping = ::mmap(
+      nullptr,
+      mapped_length,
+      PROT_READ,
+      MAP_PRIVATE,
+      fd,
+      static_cast<off_t>(aligned_offset));
+  if (mapping == MAP_FAILED) {
+    throw std::runtime_error("[ScaleXModeADirect] residency mmap failed");
+  }
+  std::pair<size_t, size_t> result;
+  try {
+    result = mapped_range_page_residency(mapping, leading, byte_length);
+  } catch (...) {
+    ::munmap(mapping, mapped_length);
+    throw;
+  }
+  ::munmap(mapping, mapped_length);
+  return result;
+}
+#endif
 
 uint32_t read_u32_le(const unsigned char* source) {
   return static_cast<uint32_t>(source[0]) |
@@ -585,6 +664,23 @@ ScaleXModeADirect::ScaleXModeADirect(
           "[ScaleXModeADirect] encoded record exceeds file bounds");
     }
   }
+#ifdef __APPLE__
+  file_mapping_ = ::mmap(
+      nullptr,
+      file_nbytes_,
+      PROT_READ,
+      MAP_PRIVATE,
+      fd_,
+      0);
+  if (file_mapping_ == MAP_FAILED) {
+    file_mapping_ = nullptr;
+    ::close(fd_);
+    fd_ = -1;
+    throw std::runtime_error(
+        "[ScaleXModeADirect] failed to create persistent file mapping");
+  }
+  ::madvise(file_mapping_, file_nbytes_, MADV_RANDOM);
+#endif
   if (prefix_store_) {
     const size_t raw_nbytes = std::accumulate(
         decoded_tensor_nbytes_.begin(), decoded_tensor_nbytes_.end(), size_t{0});
@@ -594,6 +690,10 @@ ScaleXModeADirect::ScaleXModeADirect(
     if (prefix_layer_ >= prefix_store_->layers() ||
         records_.size() != prefix_store_->experts_per_layer() ||
         expected_prefix_nbytes != prefix_store_->prefix_nbytes()) {
+#ifdef __APPLE__
+      ::munmap(file_mapping_, file_nbytes_);
+      file_mapping_ = nullptr;
+#endif
       ::close(fd_);
       fd_ = -1;
       throw std::invalid_argument(
@@ -605,6 +705,12 @@ ScaleXModeADirect::ScaleXModeADirect(
 
 ScaleXModeADirect::~ScaleXModeADirect() {
 #ifndef _WIN32
+#ifdef __APPLE__
+  if (file_mapping_ != nullptr) {
+    ::munmap(file_mapping_, file_nbytes_);
+    file_mapping_ = nullptr;
+  }
+#endif
   if (fd_ >= 0) {
     ::close(fd_);
   }
@@ -822,6 +928,128 @@ void ScaleXModeADirect::load_compressed_expert_into(
 #endif
 }
 
+size_t ScaleXModeADirect::load_compressed_expert_chunk_into(
+    size_t expert_id,
+    size_t logical_offset,
+    size_t maximum_bytes,
+    char* record_destination,
+    size_t record_destination_nbytes,
+    const std::array<char*, 3>& weight_destinations,
+    const std::array<size_t, 3>& weight_destination_nbytes) const {
+#ifdef _WIN32
+  throw std::runtime_error(
+      "[ScaleXModeADirect] chunked compressed reads require POSIX preadv");
+#else
+  if (expert_id >= records_.size()) {
+    throw std::out_of_range("[ScaleXModeADirect] expert id is out of range");
+  }
+  const auto& record = records_[expert_id];
+  const size_t raw_nbytes = std::accumulate(
+      decoded_tensor_nbytes_.begin(), decoded_tensor_nbytes_.end(), size_t{0});
+  if (maximum_bytes == 0 || record_destination == nullptr ||
+      record_destination_nbytes <
+          scalex_indexed_nbytes(record.encoded_nbytes, raw_nbytes) ||
+      std::any_of(
+          weight_destinations.begin(), weight_destinations.end(), [](char* value) {
+            return value == nullptr;
+          }) ||
+      std::any_of(
+          weight_destination_nbytes.begin(),
+          weight_destination_nbytes.end(),
+          [](size_t value) { return value == 0; })) {
+    throw std::invalid_argument(
+        "[ScaleXModeADirect] chunked destination tensor layout mismatch");
+  }
+  const size_t weight_bytes = std::accumulate(
+      weight_destination_nbytes.begin(), weight_destination_nbytes.end(), size_t{0});
+  const size_t total_bytes = record.encoded_nbytes + weight_bytes;
+  if (logical_offset > total_bytes || record.absolute_offset > file_nbytes_ ||
+      total_bytes > file_nbytes_ - record.absolute_offset) {
+    throw std::out_of_range(
+        "[ScaleXModeADirect] chunked expert range exceeds file bounds");
+  }
+  if (logical_offset == total_bytes) {
+    return 0;
+  }
+
+  const size_t requested = std::min(maximum_bytes, total_bytes - logical_offset);
+  const std::array<char*, 4> bases{
+      record_destination,
+      weight_destinations[0],
+      weight_destinations[1],
+      weight_destinations[2]};
+  const std::array<size_t, 4> lengths{
+      record.encoded_nbytes,
+      weight_destination_nbytes[0],
+      weight_destination_nbytes[1],
+      weight_destination_nbytes[2]};
+  std::array<struct iovec, 4> vectors{};
+  int vector_count = 0;
+  size_t segment_start = 0;
+  const size_t chunk_end = logical_offset + requested;
+  for (size_t segment = 0; segment < bases.size(); ++segment) {
+    const size_t segment_end = segment_start + lengths[segment];
+    const size_t begin = std::max(logical_offset, segment_start);
+    const size_t end = std::min(chunk_end, segment_end);
+    if (begin < end) {
+      vectors[vector_count].iov_base =
+          bases[segment] + (begin - segment_start);
+      vectors[vector_count].iov_len = end - begin;
+      ++vector_count;
+    }
+    segment_start = segment_end;
+  }
+  ssize_t result;
+  do {
+    result = ::preadv(
+        fd_,
+        vectors.data(),
+        vector_count,
+        static_cast<off_t>(record.absolute_offset + logical_offset));
+  } while (result < 0 && errno == EINTR);
+  if (result != static_cast<ssize_t>(requested)) {
+    // Re-reading an already completed prefix of a rare short read is safe and
+    // keeps the fallback simple and exact across segment boundaries.
+    size_t file_offset = record.absolute_offset + logical_offset;
+    for (int index = 0; index < vector_count; ++index) {
+      pread_exact(
+          fd_,
+          static_cast<char*>(vectors[index].iov_base),
+          vectors[index].iov_len,
+          file_offset);
+      file_offset += vectors[index].iov_len;
+    }
+  }
+
+  if (chunk_end == total_bytes) {
+    const auto prefix_started = std::chrono::steady_clock::now();
+    if (prefix_store_) {
+      const size_t prefix_offset = align_scalex_prefix(record.encoded_nbytes);
+      if (record.encoded_nbytes != prefix_offset) {
+        record_destination[record.encoded_nbytes] = 0;
+      }
+      std::memcpy(
+          record_destination + prefix_offset,
+          prefix_store_->prefix(prefix_layer_, expert_id),
+          prefix_store_->prefix_nbytes());
+    } else {
+      build_scalex_tile_prefix(
+          record_destination,
+          record.encoded_nbytes,
+          record_destination_nbytes,
+          raw_nbytes);
+    }
+    prefix_prepare_nanoseconds_.fetch_add(
+        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  std::chrono::steady_clock::now() - prefix_started)
+                                  .count()),
+        std::memory_order_relaxed);
+    prefix_prepare_calls_.fetch_add(1, std::memory_order_relaxed);
+  }
+  return requested;
+#endif
+}
+
 size_t ScaleXModeADirect::maximum_encoded_nbytes() const {
   return std::max_element(
              records_.begin(),
@@ -845,6 +1073,141 @@ ScaleXPrefixStats ScaleXModeADirect::prefix_stats() const {
       prefix_prepare_nanoseconds_.load(std::memory_order_relaxed),
       prefix_store_ ? prefix_store_->payload_nbytes() : size_t{0},
       prefix_store_ ? prefix_store_->load_nanoseconds() : uint64_t{0}};
+}
+
+size_t ScaleXModeADirect::advise_read(
+    size_t expert_id,
+    size_t total_bytes) const {
+  if (expert_id >= records_.size()) {
+    throw std::out_of_range("[ScaleXModeADirect] expert id is out of range");
+  }
+  const auto& record = records_[expert_id];
+  if (total_bytes < record.encoded_nbytes ||
+      record.absolute_offset > file_nbytes_ ||
+      total_bytes > file_nbytes_ - record.absolute_offset) {
+    throw std::out_of_range("[ScaleXModeADirect] advisory range is invalid");
+  }
+#ifdef __APPLE__
+  if (total_bytes > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    throw std::overflow_error(
+        "[ScaleXModeADirect] advisory range exceeds macOS limit");
+  }
+  struct radvisory advice {
+    static_cast<off_t>(record.absolute_offset), static_cast<int>(total_bytes)
+  };
+  if (::fcntl(fd_, F_RDADVISE, &advice) != 0) {
+    throw std::runtime_error(
+        "[ScaleXModeADirect] macOS asynchronous read advice failed");
+  }
+  return total_bytes;
+#else
+  throw std::runtime_error(
+      "[ScaleXModeADirect] asynchronous read advice requires macOS");
+#endif
+}
+
+std::pair<size_t, size_t> ScaleXModeADirect::page_residency(
+    size_t expert_id,
+    size_t total_bytes) const {
+  if (expert_id >= records_.size()) {
+    throw std::out_of_range("[ScaleXModeADirect] expert id is out of range");
+  }
+  const auto& record = records_[expert_id];
+  if (total_bytes < record.encoded_nbytes ||
+      record.absolute_offset > file_nbytes_ ||
+      total_bytes > file_nbytes_ - record.absolute_offset) {
+    throw std::out_of_range("[ScaleXModeADirect] residency range is invalid");
+  }
+#ifdef __APPLE__
+  return mapped_range_page_residency(
+      file_mapping_, record.absolute_offset, total_bytes);
+#else
+  throw std::runtime_error(
+      "[ScaleXModeADirect] page residency requires macOS");
+#endif
+}
+
+void ScaleXModeADirect::copy_mapped_compressed_expert_into(
+    size_t expert_id,
+    char* record_destination,
+    size_t record_destination_nbytes,
+    const std::array<char*, 3>& weight_destinations,
+    const std::array<size_t, 3>& weight_destination_nbytes) const {
+#ifdef __APPLE__
+  if (expert_id >= records_.size() || file_mapping_ == nullptr) {
+    throw std::out_of_range(
+        "[ScaleXModeADirect] mapped expert id is out of range");
+  }
+  const auto& record = records_[expert_id];
+  const size_t raw_nbytes = std::accumulate(
+      decoded_tensor_nbytes_.begin(), decoded_tensor_nbytes_.end(), size_t{0});
+  if (record_destination == nullptr ||
+      record_destination_nbytes <
+          scalex_indexed_nbytes(record.encoded_nbytes, raw_nbytes) ||
+      std::any_of(
+          weight_destinations.begin(), weight_destinations.end(), [](char* value) {
+            return value == nullptr;
+          }) ||
+      std::any_of(
+          weight_destination_nbytes.begin(),
+          weight_destination_nbytes.end(),
+          [](size_t value) { return value == 0; })) {
+    throw std::invalid_argument(
+        "[ScaleXModeADirect] mapped destination tensor layout mismatch");
+  }
+  const size_t weight_bytes = std::accumulate(
+      weight_destination_nbytes.begin(), weight_destination_nbytes.end(), size_t{0});
+  const size_t total_bytes = record.encoded_nbytes + weight_bytes;
+  if (record.absolute_offset > file_nbytes_ ||
+      total_bytes > file_nbytes_ - record.absolute_offset) {
+    throw std::runtime_error(
+        "[ScaleXModeADirect] mapped expert range exceeds file bounds");
+  }
+
+  const auto* source =
+      static_cast<const char*>(file_mapping_) + record.absolute_offset;
+  std::memcpy(record_destination, source, record.encoded_nbytes);
+  source += record.encoded_nbytes;
+  for (size_t tensor = 0; tensor < weight_destinations.size(); ++tensor) {
+    std::memcpy(
+        weight_destinations[tensor], source, weight_destination_nbytes[tensor]);
+    source += weight_destination_nbytes[tensor];
+  }
+  if (prefix_store_) {
+    const size_t prefix_offset = align_scalex_prefix(record.encoded_nbytes);
+    if (record.encoded_nbytes != prefix_offset) {
+      record_destination[record.encoded_nbytes] = 0;
+    }
+    std::memcpy(
+        record_destination + prefix_offset,
+        prefix_store_->prefix(prefix_layer_, expert_id),
+        prefix_store_->prefix_nbytes());
+  } else {
+    build_scalex_tile_prefix(
+        record_destination,
+        record.encoded_nbytes,
+        record_destination_nbytes,
+        raw_nbytes);
+  }
+
+  // The authoritative copy now lives in wired MLX memory. Drop only complete
+  // interior source pages from this process mapping so speculative reads do
+  // not inflate RSS; boundary pages may be shared with adjacent experts.
+  const size_t page_size = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+  const size_t interior_begin =
+      ((record.absolute_offset + page_size - 1) / page_size) * page_size;
+  const size_t interior_end =
+      ((record.absolute_offset + total_bytes) / page_size) * page_size;
+  if (interior_begin < interior_end) {
+    ::madvise(
+        static_cast<char*>(file_mapping_) + interior_begin,
+        interior_end - interior_begin,
+        MADV_DONTNEED);
+  }
+#else
+  throw std::runtime_error(
+      "[ScaleXModeADirect] mapped expert copies require macOS");
+#endif
 }
 
 SafetensorsRowDirect::SafetensorsRowDirect(

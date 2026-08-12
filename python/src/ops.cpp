@@ -766,6 +766,40 @@ void init_ops(nb::module_& m) {
       nb::sig(
           "def _scalex_mode_a_prefix_stats(direct: _ScaleXModeADirect) -> dict"));
   m.def(
+      "_scalex_mode_a_advise_read",
+      [](std::shared_ptr<mx::ScaleXModeADirect> direct,
+         size_t expert_id,
+         size_t total_bytes) {
+        if (!direct) {
+          throw std::invalid_argument(
+              "[_scalex_mode_a_advise_read] invalid handle");
+        }
+        nb::gil_scoped_release release;
+        return direct->advise_read(expert_id, total_bytes);
+      },
+      "direct"_a,
+      "expert_id"_a,
+      "total_bytes"_a,
+      nb::sig(
+          "def _scalex_mode_a_advise_read(direct: _ScaleXModeADirect, expert_id: int, total_bytes: int) -> int"));
+  m.def(
+      "_scalex_mode_a_page_residency",
+      [](std::shared_ptr<mx::ScaleXModeADirect> direct,
+         size_t expert_id,
+         size_t total_bytes) {
+        if (!direct) {
+          throw std::invalid_argument(
+              "[_scalex_mode_a_page_residency] invalid handle");
+        }
+        nb::gil_scoped_release release;
+        return direct->page_residency(expert_id, total_bytes);
+      },
+      "direct"_a,
+      "expert_id"_a,
+      "total_bytes"_a,
+      nb::sig(
+          "def _scalex_mode_a_page_residency(direct: _ScaleXModeADirect, expert_id: int, total_bytes: int) -> tuple[int, int]"));
+  m.def(
       "_open_safetensors_row_direct",
       [](nb::object file,
          const std::string& dtype,
@@ -1185,6 +1219,176 @@ void init_ops(nb::module_& m) {
       "weight_row_nbytes"_a,
       nb::sig(
           "def _scalex_mode_b_load_full_split_into_many(direct: _ScaleXModeADirect, expert_ids: list[int], gate_up_slots: list[int], down_slots: list[int], record_destinations: array, gate_destinations: array, down_destinations: array, up_destinations: array, weight_row_nbytes: list[int]) -> None"));
+  m.def(
+      "_scalex_mode_b_load_full_split_chunk",
+      [](std::shared_ptr<mx::ScaleXModeADirect> direct,
+         size_t expert_id,
+         size_t gate_up_slot,
+         size_t down_slot,
+         size_t logical_offset,
+         size_t maximum_bytes,
+         mx::array record_destinations,
+         mx::array gate_destinations,
+         mx::array down_destinations,
+         mx::array up_destinations,
+         const std::vector<size_t>& weight_row_nbytes) {
+        if (!direct || weight_row_nbytes.size() != 3 ||
+            record_destinations.ndim() != 2 ||
+            record_destinations.dtype() != mx::uint8 ||
+            gate_destinations.dtype() != mx::uint32 ||
+            down_destinations.dtype() != mx::uint32 ||
+            up_destinations.dtype() != mx::uint32 ||
+            gate_destinations.ndim() != 3 || down_destinations.ndim() != 3 ||
+            up_destinations.ndim() != 3) {
+          throw std::invalid_argument(
+              "[_scalex_mode_b_load_full_split_chunk] invalid arguments");
+        }
+        const size_t gate_up_capacity = record_destinations.shape(0);
+        const size_t down_capacity = down_destinations.shape(0);
+        if (gate_up_capacity == 0 || down_capacity == 0 ||
+            gate_up_slot >= gate_up_capacity || down_slot >= down_capacity ||
+            gate_destinations.shape(0) != gate_up_capacity ||
+            up_destinations.shape(0) != gate_up_capacity) {
+          throw std::invalid_argument(
+              "[_scalex_mode_b_load_full_split_chunk] invalid capacities or rows");
+        }
+        for (auto* destination :
+             {&record_destinations,
+              &gate_destinations,
+              &down_destinations,
+              &up_destinations}) {
+          if (!destination->is_available()) {
+            destination->eval();
+          }
+          if (!destination->flags().row_contiguous) {
+            throw std::invalid_argument(
+                "[_scalex_mode_b_load_full_split_chunk] destinations must be row-contiguous");
+          }
+        }
+        const size_t record_row_nbytes =
+            record_destinations.nbytes() / gate_up_capacity;
+        if (record_row_nbytes < direct->maximum_indexed_nbytes() ||
+            gate_destinations.nbytes() / gate_up_capacity != weight_row_nbytes[0] ||
+            down_destinations.nbytes() / down_capacity != weight_row_nbytes[1] ||
+            up_destinations.nbytes() / gate_up_capacity != weight_row_nbytes[2]) {
+          throw std::invalid_argument(
+              "[_scalex_mode_b_load_full_split_chunk] row geometry changed");
+        }
+        auto* record_base = record_destinations.data<char>();
+        auto* gate_base = gate_destinations.data<char>();
+        auto* down_base = down_destinations.data<char>();
+        auto* up_base = up_destinations.data<char>();
+        const std::array<char*, 3> pointers{
+            gate_base + gate_up_slot * weight_row_nbytes[0],
+            down_base + down_slot * weight_row_nbytes[1],
+            up_base + gate_up_slot * weight_row_nbytes[2]};
+        const std::array<size_t, 3> row_nbytes{
+            weight_row_nbytes[0], weight_row_nbytes[1], weight_row_nbytes[2]};
+        nb::gil_scoped_release release;
+        return direct->load_compressed_expert_chunk_into(
+            expert_id,
+            logical_offset,
+            maximum_bytes,
+            record_base + gate_up_slot * record_row_nbytes,
+            record_row_nbytes,
+            pointers,
+            row_nbytes);
+      },
+      "direct"_a,
+      "expert_id"_a,
+      "gate_up_slot"_a,
+      "down_slot"_a,
+      "logical_offset"_a,
+      "maximum_bytes"_a,
+      "record_destinations"_a,
+      "gate_destinations"_a,
+      "down_destinations"_a,
+      "up_destinations"_a,
+      "weight_row_nbytes"_a,
+      nb::sig(
+          "def _scalex_mode_b_load_full_split_chunk(direct: _ScaleXModeADirect, expert_id: int, gate_up_slot: int, down_slot: int, logical_offset: int, maximum_bytes: int, record_destinations: array, gate_destinations: array, down_destinations: array, up_destinations: array, weight_row_nbytes: list[int]) -> int"));
+  m.def(
+      "_scalex_mode_b_copy_mapped_full_split",
+      [](std::shared_ptr<mx::ScaleXModeADirect> direct,
+         size_t expert_id,
+         size_t gate_up_slot,
+         size_t down_slot,
+         mx::array record_destinations,
+         mx::array gate_destinations,
+         mx::array down_destinations,
+         mx::array up_destinations,
+         const std::vector<size_t>& weight_row_nbytes) {
+        if (!direct || weight_row_nbytes.size() != 3 ||
+            record_destinations.ndim() != 2 ||
+            record_destinations.dtype() != mx::uint8 ||
+            gate_destinations.dtype() != mx::uint32 ||
+            down_destinations.dtype() != mx::uint32 ||
+            up_destinations.dtype() != mx::uint32 ||
+            gate_destinations.ndim() != 3 || down_destinations.ndim() != 3 ||
+            up_destinations.ndim() != 3) {
+          throw std::invalid_argument(
+              "[_scalex_mode_b_copy_mapped_full_split] invalid arguments");
+        }
+        const size_t gate_up_capacity = record_destinations.shape(0);
+        const size_t down_capacity = down_destinations.shape(0);
+        if (gate_up_capacity == 0 || down_capacity == 0 ||
+            gate_up_slot >= gate_up_capacity || down_slot >= down_capacity ||
+            gate_destinations.shape(0) != gate_up_capacity ||
+            up_destinations.shape(0) != gate_up_capacity) {
+          throw std::invalid_argument(
+              "[_scalex_mode_b_copy_mapped_full_split] invalid capacities or rows");
+        }
+        for (auto* destination :
+             {&record_destinations,
+              &gate_destinations,
+              &down_destinations,
+              &up_destinations}) {
+          if (!destination->is_available()) {
+            destination->eval();
+          }
+          if (!destination->flags().row_contiguous) {
+            throw std::invalid_argument(
+                "[_scalex_mode_b_copy_mapped_full_split] destinations must be row-contiguous");
+          }
+        }
+        const size_t record_row_nbytes =
+            record_destinations.nbytes() / gate_up_capacity;
+        if (record_row_nbytes < direct->maximum_indexed_nbytes() ||
+            gate_destinations.nbytes() / gate_up_capacity != weight_row_nbytes[0] ||
+            down_destinations.nbytes() / down_capacity != weight_row_nbytes[1] ||
+            up_destinations.nbytes() / gate_up_capacity != weight_row_nbytes[2]) {
+          throw std::invalid_argument(
+              "[_scalex_mode_b_copy_mapped_full_split] row geometry changed");
+        }
+        auto* record_base = record_destinations.data<char>();
+        auto* gate_base = gate_destinations.data<char>();
+        auto* down_base = down_destinations.data<char>();
+        auto* up_base = up_destinations.data<char>();
+        const std::array<char*, 3> pointers{
+            gate_base + gate_up_slot * weight_row_nbytes[0],
+            down_base + down_slot * weight_row_nbytes[1],
+            up_base + gate_up_slot * weight_row_nbytes[2]};
+        const std::array<size_t, 3> row_nbytes{
+            weight_row_nbytes[0], weight_row_nbytes[1], weight_row_nbytes[2]};
+        nb::gil_scoped_release release;
+        direct->copy_mapped_compressed_expert_into(
+            expert_id,
+            record_base + gate_up_slot * record_row_nbytes,
+            record_row_nbytes,
+            pointers,
+            row_nbytes);
+      },
+      "direct"_a,
+      "expert_id"_a,
+      "gate_up_slot"_a,
+      "down_slot"_a,
+      "record_destinations"_a,
+      "gate_destinations"_a,
+      "down_destinations"_a,
+      "up_destinations"_a,
+      "weight_row_nbytes"_a,
+      nb::sig(
+          "def _scalex_mode_b_copy_mapped_full_split(direct: _ScaleXModeADirect, expert_id: int, gate_up_slot: int, down_slot: int, record_destinations: array, gate_destinations: array, down_destinations: array, up_destinations: array, weight_row_nbytes: list[int]) -> None"));
   m.def(
       "_expert_ssd_copy_rows",
       [](std::vector<mx::array> sources,
