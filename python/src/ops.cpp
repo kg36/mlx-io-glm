@@ -1,10 +1,14 @@
 // Copyright © 2023-2024 Apple Inc.
 
-#include <deque>
+#include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
+#include <exception>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <ostream>
 #include <sstream>
@@ -12,6 +16,8 @@
 #include <variant>
 
 #include <sys/mman.h>
+
+#include <dispatch/dispatch.h>
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
@@ -441,12 +447,120 @@ nb::tuple official_direct_route_plan(mx::array indices) {
       "[_expert_ssd_route_plan] indices must be int32, int64, uint32, or uint64");
 }
 
+struct ScaleXAsyncBatchState {
+  ScaleXAsyncBatchState(
+      std::shared_ptr<mx::ScaleXModeADirect> direct,
+      std::vector<size_t> expert_ids,
+      std::vector<size_t> gate_up_slots,
+      std::vector<size_t> down_slots,
+      mx::array record_destinations,
+      mx::array gate_destinations,
+      mx::array down_destinations,
+      mx::array up_destinations,
+      size_t worker_count,
+      bool interactive_qos,
+      std::shared_ptr<mx::ExpertSSDIoEventState> event_state,
+      uint64_t event_value)
+      : direct(std::move(direct)),
+        expert_ids(std::move(expert_ids)),
+        gate_up_slots(std::move(gate_up_slots)),
+        down_slots(std::move(down_slots)),
+        record_destinations(std::move(record_destinations)),
+        gate_destinations(std::move(gate_destinations)),
+        down_destinations(std::move(down_destinations)),
+        up_destinations(std::move(up_destinations)),
+        worker_count(worker_count),
+        interactive_qos(interactive_qos),
+        event_state(std::move(event_state)),
+        event_value(event_value) {}
+
+  std::shared_ptr<mx::ScaleXModeADirect> direct;
+  std::vector<size_t> expert_ids;
+  std::vector<size_t> gate_up_slots;
+  std::vector<size_t> down_slots;
+  mx::array record_destinations;
+  mx::array gate_destinations;
+  mx::array down_destinations;
+  mx::array up_destinations;
+  char* record_base{nullptr};
+  char* gate_base{nullptr};
+  char* down_base{nullptr};
+  char* up_base{nullptr};
+  size_t record_row_nbytes{0};
+  std::array<size_t, 3> row_nbytes{};
+  size_t worker_count{0};
+  bool interactive_qos{false};
+  std::shared_ptr<mx::ExpertSSDIoEventState> event_state;
+  uint64_t event_value{0};
+  std::atomic<size_t> next{0};
+  std::mutex error_mutex;
+  std::exception_ptr error;
+  std::mutex completion_mutex;
+  std::condition_variable completion_condition;
+  bool complete{false};
+};
+
+void scalex_async_batch_worker(void* raw, size_t) {
+  auto* state = static_cast<ScaleXAsyncBatchState*>(raw);
+  while (true) {
+    const size_t item = state->next.fetch_add(1);
+    if (item >= state->expert_ids.size()) {
+      return;
+    }
+    try {
+      const std::array<char*, 3> pointers{
+          state->gate_base +
+              state->gate_up_slots[item] * state->row_nbytes[0],
+          state->down_base + state->down_slots[item] * state->row_nbytes[1],
+          state->up_base +
+              state->gate_up_slots[item] * state->row_nbytes[2]};
+      state->direct->load_compressed_expert_into(
+          state->expert_ids[item],
+          state->record_base +
+              state->gate_up_slots[item] * state->record_row_nbytes,
+          state->record_row_nbytes,
+          pointers,
+          state->row_nbytes);
+    } catch (...) {
+      std::lock_guard<std::mutex> lock(state->error_mutex);
+      if (!state->error) {
+        state->error = std::current_exception();
+      }
+      return;
+    }
+  }
+}
+
+void scalex_async_batch_run(void* raw) {
+  std::unique_ptr<std::shared_ptr<ScaleXAsyncBatchState>> owner(
+      static_cast<std::shared_ptr<ScaleXAsyncBatchState>*>(raw));
+  auto state = *owner;
+  const auto queue = dispatch_get_global_queue(
+      state->interactive_qos ? QOS_CLASS_USER_INTERACTIVE
+                             : QOS_CLASS_USER_INITIATED,
+      0);
+  dispatch_apply_f(
+      std::min(state->worker_count, state->expert_ids.size()),
+      queue,
+      state.get(),
+      scalex_async_batch_worker);
+  {
+    std::lock_guard<std::mutex> lock(state->completion_mutex);
+    state->complete = true;
+  }
+  state->completion_condition.notify_all();
+  // Always release Metal, including on an I/O exception. The cleanup waiter
+  // rethrows the captured exception before the cache can be reused.
+  mx::expert_ssd_io_event_signal(state->event_state, state->event_value);
+}
+
 void init_ops(nb::module_& m) {
   nb::class_<mx::ExpertSafetensorsDirect>(m, "_ExpertSafetensorsDirect");
   nb::class_<mx::ScaleXPrefixStore>(m, "_ScaleXPrefixStore");
   nb::class_<mx::ScaleXModeADirect>(m, "_ScaleXModeADirect");
   nb::class_<mx::SafetensorsRowDirect>(m, "_SafetensorsRowDirect");
   nb::class_<mx::ExpertSSDIoEventState>(m, "_ExpertSSDIoEventState");
+  nb::class_<ScaleXAsyncBatchState>(m, "_ScaleXAsyncBatchState");
   nb::class_<ExpertSSDMarkovState>(m, "_ExpertSSDMarkovState");
   m.def(
       "_expert_ssd_markov_state_new",
@@ -1219,6 +1333,145 @@ void init_ops(nb::module_& m) {
       "weight_row_nbytes"_a,
       nb::sig(
           "def _scalex_mode_b_load_full_split_into_many(direct: _ScaleXModeADirect, expert_ids: list[int], gate_up_slots: list[int], down_slots: list[int], record_destinations: array, gate_destinations: array, down_destinations: array, up_destinations: array, weight_row_nbytes: list[int]) -> None"));
+  m.def(
+      "_scalex_mode_b_load_full_split_async",
+      [](std::shared_ptr<mx::ScaleXModeADirect> direct,
+         std::vector<size_t> expert_ids,
+         std::vector<size_t> gate_up_slots,
+         std::vector<size_t> down_slots,
+         mx::array record_destinations,
+         mx::array gate_destinations,
+         mx::array down_destinations,
+         mx::array up_destinations,
+         const std::vector<size_t>& weight_row_nbytes,
+         size_t worker_count,
+         bool interactive_qos,
+         std::shared_ptr<mx::ExpertSSDIoEventState> event_state,
+         uint64_t event_value) {
+        if (!direct || !event_state || event_value == 0 ||
+            expert_ids.empty() || expert_ids.size() != gate_up_slots.size() ||
+            expert_ids.size() != down_slots.size() ||
+            weight_row_nbytes.size() != 3 || worker_count == 0 ||
+            record_destinations.ndim() != 2 ||
+            record_destinations.dtype() != mx::uint8 ||
+            gate_destinations.dtype() != mx::uint32 ||
+            down_destinations.dtype() != mx::uint32 ||
+            up_destinations.dtype() != mx::uint32 ||
+            gate_destinations.ndim() != 3 || down_destinations.ndim() != 3 ||
+            up_destinations.ndim() != 3) {
+          throw std::invalid_argument(
+              "[_scalex_mode_b_load_full_split_async] invalid arguments");
+        }
+        const size_t gate_up_capacity = record_destinations.shape(0);
+        const size_t down_capacity = down_destinations.shape(0);
+        if (gate_up_capacity == 0 || down_capacity == 0 ||
+            gate_destinations.shape(0) != gate_up_capacity ||
+            up_destinations.shape(0) != gate_up_capacity) {
+          throw std::invalid_argument(
+              "[_scalex_mode_b_load_full_split_async] capacities differ");
+        }
+        for (auto* destination :
+             {&record_destinations,
+              &gate_destinations,
+              &down_destinations,
+              &up_destinations}) {
+          if (!destination->is_available()) {
+            destination->eval();
+          }
+          if (!destination->flags().row_contiguous) {
+            throw std::invalid_argument(
+                "[_scalex_mode_b_load_full_split_async] destinations must be row-contiguous");
+          }
+        }
+        const size_t record_row_nbytes =
+            record_destinations.nbytes() / gate_up_capacity;
+        if (record_row_nbytes < direct->maximum_indexed_nbytes() ||
+            gate_destinations.nbytes() / gate_up_capacity !=
+                weight_row_nbytes[0] ||
+            down_destinations.nbytes() / down_capacity !=
+                weight_row_nbytes[1] ||
+            up_destinations.nbytes() / gate_up_capacity !=
+                weight_row_nbytes[2]) {
+          throw std::invalid_argument(
+              "[_scalex_mode_b_load_full_split_async] row geometry changed");
+        }
+        for (size_t item = 0; item < expert_ids.size(); ++item) {
+          if (gate_up_slots[item] >= gate_up_capacity ||
+              down_slots[item] >= down_capacity) {
+            throw std::out_of_range(
+                "[_scalex_mode_b_load_full_split_async] slot is out of range");
+          }
+        }
+
+        auto state = std::make_shared<ScaleXAsyncBatchState>(
+            std::move(direct),
+            std::move(expert_ids),
+            std::move(gate_up_slots),
+            std::move(down_slots),
+            std::move(record_destinations),
+            std::move(gate_destinations),
+            std::move(down_destinations),
+            std::move(up_destinations),
+            worker_count,
+            interactive_qos,
+            std::move(event_state),
+            event_value);
+        state->record_row_nbytes = record_row_nbytes;
+        state->row_nbytes = {
+            weight_row_nbytes[0],
+            weight_row_nbytes[1],
+            weight_row_nbytes[2]};
+        state->record_base = state->record_destinations.data<char>();
+        state->gate_base = state->gate_destinations.data<char>();
+        state->down_base = state->down_destinations.data<char>();
+        state->up_base = state->up_destinations.data<char>();
+        dispatch_async_f(
+            dispatch_get_global_queue(
+                interactive_qos ? QOS_CLASS_USER_INTERACTIVE
+                                : QOS_CLASS_USER_INITIATED,
+                0),
+            new std::shared_ptr<ScaleXAsyncBatchState>(state),
+            scalex_async_batch_run);
+        return state;
+      },
+      "direct"_a,
+      "expert_ids"_a,
+      "gate_up_slots"_a,
+      "down_slots"_a,
+      "record_destinations"_a,
+      "gate_destinations"_a,
+      "down_destinations"_a,
+      "up_destinations"_a,
+      "weight_row_nbytes"_a,
+      "worker_count"_a,
+      "interactive_qos"_a,
+      "event_state"_a,
+      "event_value"_a,
+      nb::sig(
+          "def _scalex_mode_b_load_full_split_async(direct: _ScaleXModeADirect, expert_ids: list[int], gate_up_slots: list[int], down_slots: list[int], record_destinations: array, gate_destinations: array, down_destinations: array, up_destinations: array, weight_row_nbytes: list[int], worker_count: int, interactive_qos: bool, event_state: _ExpertSSDIoEventState, event_value: int) -> _ScaleXAsyncBatchState"));
+  m.def(
+      "_scalex_mode_b_async_wait",
+      [](const std::shared_ptr<ScaleXAsyncBatchState>& state) {
+        if (!state) {
+          throw std::invalid_argument(
+              "[_scalex_mode_b_async_wait] state required");
+        }
+        std::exception_ptr error;
+        {
+          nb::gil_scoped_release release;
+          std::unique_lock<std::mutex> lock(state->completion_mutex);
+          state->completion_condition.wait(
+              lock, [&]() { return state->complete; });
+          std::lock_guard<std::mutex> error_lock(state->error_mutex);
+          error = state->error;
+        }
+        if (error) {
+          std::rethrow_exception(error);
+        }
+      },
+      "state"_a,
+      nb::sig(
+          "def _scalex_mode_b_async_wait(state: _ScaleXAsyncBatchState) -> None"));
   m.def(
       "_scalex_mode_b_load_full_split_chunk",
       [](std::shared_ptr<mx::ScaleXModeADirect> direct,
