@@ -1,5 +1,6 @@
 // Copyright © 2023-2024 Apple Inc.
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
@@ -207,6 +208,432 @@ class ExpertSSDMarkovState {
   std::vector<float> transitions_;
   std::vector<float> totals_;
   std::deque<std::vector<int64_t>> history_;
+};
+
+struct ExpertSSDRouteCachePlan {
+  std::vector<int64_t> routed;
+  std::vector<int64_t> unique;
+  std::vector<int32_t> counts;
+  std::vector<int32_t> compact;
+  std::vector<int32_t> gate_up_rows;
+  std::vector<int32_t> down_rows;
+  std::vector<uint8_t> resident_before;
+  std::vector<int64_t> missing;
+  std::vector<int32_t> missing_gate_up_rows;
+  std::vector<int32_t> missing_down_rows;
+  std::vector<int64_t> evicted;
+  size_t hits{0};
+  size_t misses{0};
+};
+
+class ExpertSSDRouteCacheState {
+ public:
+  ExpertSSDRouteCacheState(
+      size_t expert_count,
+      size_t capacity,
+      double retention_decay,
+      double interval_alpha,
+      double initial_interval,
+      double age_weight,
+      double markov_boost,
+      std::shared_ptr<ExpertSSDMarkovState> markov)
+      : expert_count_(expert_count),
+        capacity_(capacity),
+        retention_decay_(retention_decay),
+        interval_alpha_(interval_alpha),
+        initial_interval_(initial_interval),
+        age_weight_(age_weight),
+        markov_boost_(markov_boost),
+        markov_(std::move(markov)),
+        expert_to_slot_(expert_count, -1),
+        down_expert_to_slot_(expert_count, -1),
+        retention_scores_(expert_count, 0.0),
+        lhd_demand_(expert_count, 0.0),
+        lhd_last_seen_(expert_count, -1),
+        lhd_interval_ema_(expert_count, initial_interval) {
+    if (expert_count_ == 0 || capacity_ == 0 || capacity_ > expert_count_) {
+      throw std::invalid_argument(
+          "ExpertSSD route-cache dimensions are invalid");
+    }
+    if (retention_decay_ < 0.0 || retention_decay_ > 1.0 ||
+        interval_alpha_ <= 0.0 || interval_alpha_ > 1.0 ||
+        initial_interval_ <= 0.0 || age_weight_ < 0.0 ||
+        markov_boost_ < 0.0) {
+      throw std::invalid_argument(
+          "ExpertSSD route-cache policy parameters are invalid");
+    }
+    for (size_t slot = capacity_; slot > 0; --slot) {
+      free_slots_.push_back(static_cast<int32_t>(slot - 1));
+      free_down_slots_.push_back(static_cast<int32_t>(slot - 1));
+    }
+  }
+
+  void restore(
+      const std::vector<std::pair<int64_t, int64_t>>& expert_slots,
+      const std::vector<std::pair<int64_t, int64_t>>& down_expert_slots,
+      const std::vector<std::pair<int64_t, double>>& retention_scores,
+      int64_t lhd_clock,
+      double demand_scale,
+      const std::vector<double>& demand,
+      const std::vector<int64_t>& last_seen,
+      const std::vector<double>& interval_ema) {
+    if (expert_slots.size() > capacity_ ||
+        down_expert_slots.size() != expert_slots.size() ||
+        demand.size() != expert_count_ || last_seen.size() != expert_count_ ||
+        interval_ema.size() != expert_count_ || lhd_clock < 0 ||
+        demand_scale <= 0.0) {
+      throw std::invalid_argument(
+          "ExpertSSD route-cache restore geometry is invalid");
+    }
+    std::fill(expert_to_slot_.begin(), expert_to_slot_.end(), -1);
+    std::fill(
+        down_expert_to_slot_.begin(), down_expert_to_slot_.end(), -1);
+    std::fill(retention_scores_.begin(), retention_scores_.end(), 0.0);
+    lru_.clear();
+    std::vector<uint8_t> used(capacity_, 0);
+    std::vector<uint8_t> down_used(capacity_, 0);
+    for (const auto& [expert, slot] : expert_slots) {
+      validate_pair(expert, slot, used);
+      expert_to_slot_[expert] = slot;
+      used[slot] = 1;
+      lru_.push_back(expert);
+    }
+    for (const auto& [expert, slot] : down_expert_slots) {
+      validate_pair(expert, slot, down_used);
+      if (expert_to_slot_[expert] < 0) {
+        throw std::invalid_argument(
+            "ExpertSSD route-cache Down set diverges from Gate/Up");
+      }
+      down_expert_to_slot_[expert] = slot;
+      down_used[slot] = 1;
+    }
+    for (size_t expert = 0; expert < expert_count_; ++expert) {
+      if ((expert_to_slot_[expert] >= 0) !=
+          (down_expert_to_slot_[expert] >= 0)) {
+        throw std::invalid_argument(
+            "ExpertSSD route-cache restored resident sets diverge");
+      }
+    }
+    for (const auto& [expert, score] : retention_scores) {
+      if (expert < 0 || static_cast<size_t>(expert) >= expert_count_ ||
+          !std::isfinite(score)) {
+        throw std::invalid_argument(
+            "ExpertSSD route-cache retention score is invalid");
+      }
+      retention_scores_[expert] = score;
+    }
+    free_slots_.clear();
+    free_down_slots_.clear();
+    for (size_t slot = capacity_; slot > 0; --slot) {
+      if (!used[slot - 1]) {
+        free_slots_.push_back(static_cast<int32_t>(slot - 1));
+      }
+      if (!down_used[slot - 1]) {
+        free_down_slots_.push_back(static_cast<int32_t>(slot - 1));
+      }
+    }
+    lhd_clock_ = lhd_clock;
+    demand_scale_ = demand_scale;
+    lhd_demand_ = demand;
+    lhd_last_seen_ = last_seen;
+    lhd_interval_ema_ = interval_ema;
+  }
+
+  ExpertSSDRouteCachePlan plan(const mx::array& indices) {
+    ExpertSSDRouteCachePlan output;
+    if (indices.dtype() == mx::int32) {
+      flatten<int32_t>(indices, output.routed);
+    } else if (indices.dtype() == mx::int64) {
+      flatten<int64_t>(indices, output.routed);
+    } else if (indices.dtype() == mx::uint32) {
+      flatten<uint32_t>(indices, output.routed);
+    } else if (indices.dtype() == mx::uint64) {
+      flatten<uint64_t>(indices, output.routed);
+    } else {
+      throw std::invalid_argument(
+          "ExpertSSD route-cache indices must be integral");
+    }
+    output.compact.reserve(output.routed.size());
+    std::unordered_map<int64_t, int32_t> compact_ids;
+    compact_ids.reserve(std::min<size_t>(output.routed.size(), expert_count_));
+    for (const auto expert : output.routed) {
+      validate_expert(expert);
+      auto [iterator, inserted] = compact_ids.emplace(
+          expert, static_cast<int32_t>(output.unique.size()));
+      if (inserted) {
+        output.unique.push_back(expert);
+        output.counts.push_back(0);
+      }
+      output.compact.push_back(iterator->second);
+      output.counts[iterator->second] += 1;
+    }
+    if (output.unique.size() > capacity_) {
+      throw std::invalid_argument(
+          "ExpertSSD route exceeds native cache capacity");
+    }
+
+    std::vector<uint8_t> protected_expert(expert_count_, 0);
+    std::vector<int64_t> resident_before;
+    resident_before.reserve(lru_.size());
+    for (const auto expert : lru_) {
+      resident_before.push_back(expert);
+    }
+    for (const auto expert : output.unique) {
+      protected_expert[expert] = 1;
+      output.resident_before.push_back(expert_to_slot_[expert] >= 0);
+    }
+
+    decay_retention();
+    std::vector<double> markov_scores(expert_count_, 0.0);
+    if (markov_) {
+      const auto scores = markov_->update_and_score(
+          output.unique, resident_before);
+      for (size_t index = 0; index < resident_before.size(); ++index) {
+        markov_scores[resident_before[index]] = scores[index];
+      }
+    }
+    record_lhd_accesses(output.unique, output.counts);
+
+    for (size_t index = 0; index < output.unique.size(); ++index) {
+      const auto expert = output.unique[index];
+      auto slot = expert_to_slot_[expert];
+      if (slot >= 0) {
+        touch(expert);
+        ++output.hits;
+        continue;
+      }
+      ++output.misses;
+      if (!free_slots_.empty()) {
+        slot = free_slots_.back();
+        free_slots_.pop_back();
+      } else {
+        const auto victim = choose_victim(protected_expert, markov_scores);
+        slot = expert_to_slot_[victim];
+        expert_to_slot_[victim] = -1;
+        retention_scores_[victim] = 0.0;
+        erase_lru(victim);
+        output.evicted.push_back(victim);
+      }
+      expert_to_slot_[expert] = slot;
+      lru_.push_back(expert);
+      output.missing.push_back(expert);
+      output.missing_gate_up_rows.push_back(slot);
+    }
+
+    // Down uses a separate physical row bank but exactly the same logical
+    // resident set. Reclaim the rows of the Gate/Up victims first, then assign
+    // rows to newly admitted experts in first-seen route order.
+    for (const auto victim : output.evicted) {
+      const auto row = down_expert_to_slot_[victim];
+      if (row < 0) {
+        throw std::invalid_argument(
+            "ExpertSSD route-cache Down map lost a victim");
+      }
+      down_expert_to_slot_[victim] = -1;
+      free_down_slots_.push_back(row);
+    }
+    for (const auto expert : output.unique) {
+      if (down_expert_to_slot_[expert] >= 0) {
+        continue;
+      }
+      if (free_down_slots_.empty()) {
+        throw std::invalid_argument(
+            "ExpertSSD route-cache Down free rows diverged");
+      }
+      down_expert_to_slot_[expert] = free_down_slots_.back();
+      free_down_slots_.pop_back();
+    }
+    output.gate_up_rows.reserve(output.unique.size());
+    output.down_rows.reserve(output.unique.size());
+    for (const auto expert : output.unique) {
+      output.gate_up_rows.push_back(expert_to_slot_[expert]);
+      output.down_rows.push_back(down_expert_to_slot_[expert]);
+    }
+    for (const auto expert : output.missing) {
+      output.missing_down_rows.push_back(down_expert_to_slot_[expert]);
+    }
+    hits_ += output.hits;
+    misses_ += output.misses;
+    evictions_ += output.evicted.size();
+    return output;
+  }
+
+  nb::dict metadata() const {
+    nb::dict output;
+    nb::list expert_slots;
+    nb::list down_slots;
+    for (const auto expert : lru_) {
+      expert_slots.append(nb::make_tuple(expert, expert_to_slot_[expert]));
+      down_slots.append(
+          nb::make_tuple(expert, down_expert_to_slot_[expert]));
+    }
+    nb::list scores;
+    for (size_t expert = 0; expert < expert_count_; ++expert) {
+      if (retention_scores_[expert] != 0.0) {
+        scores.append(
+            nb::make_tuple(expert, retention_scores_[expert]));
+      }
+    }
+    output["expert_slots"] = expert_slots;
+    output["down_expert_slots"] = down_slots;
+    output["retention_scores"] = scores;
+    output["clock"] = lhd_clock_;
+    output["demand_scale"] = demand_scale_;
+    output["demand"] = lhd_demand_;
+    output["last_seen"] = lhd_last_seen_;
+    output["interval_ema"] = lhd_interval_ema_;
+    output["hits"] = hits_;
+    output["misses"] = misses_;
+    output["evictions"] = evictions_;
+    return output;
+  }
+
+ private:
+  void validate_expert(int64_t expert) const {
+    if (expert < 0 || static_cast<size_t>(expert) >= expert_count_) {
+      throw std::invalid_argument(
+          "ExpertSSD route-cache expert id is out of range");
+    }
+  }
+
+  void validate_pair(
+      int64_t expert,
+      int64_t slot,
+      const std::vector<uint8_t>& used) const {
+    validate_expert(expert);
+    if (slot < 0 || static_cast<size_t>(slot) >= capacity_ || used[slot]) {
+      throw std::invalid_argument(
+          "ExpertSSD route-cache slot assignment is invalid");
+    }
+  }
+
+  template <typename T>
+  void flatten(const mx::array& indices, std::vector<int64_t>& output) const {
+    const auto* data = indices.data<T>();
+    const auto shape = indices.shape();
+    const auto strides = indices.strides();
+    output.reserve(indices.size());
+    std::vector<size_t> coordinates(shape.size(), 0);
+    for (size_t flat = 0; flat < indices.size(); ++flat) {
+      size_t physical = 0;
+      for (size_t dimension = 0; dimension < shape.size(); ++dimension) {
+        physical += coordinates[dimension] * strides[dimension];
+      }
+      output.push_back(static_cast<int64_t>(data[physical]));
+      for (int dimension = static_cast<int>(shape.size()) - 1;
+           dimension >= 0;
+           --dimension) {
+        coordinates[dimension] += 1;
+        if (coordinates[dimension] <
+            static_cast<size_t>(shape[dimension])) {
+          break;
+        }
+        coordinates[dimension] = 0;
+      }
+    }
+  }
+
+  void decay_retention() {
+    demand_scale_ *= retention_decay_;
+    if (demand_scale_ < 1e-6) {
+      for (auto& demand : lhd_demand_) {
+        demand *= demand_scale_;
+      }
+      demand_scale_ = 1.0;
+    }
+  }
+
+  void record_lhd_accesses(
+      const std::vector<int64_t>& experts,
+      const std::vector<int32_t>& counts) {
+    for (size_t index = 0; index < experts.size(); ++index) {
+      const auto expert = experts[index];
+      ++lhd_clock_;
+      const auto previous = lhd_last_seen_[expert];
+      if (previous < 0) {
+        lhd_interval_ema_[expert] = initial_interval_;
+      } else {
+        const auto interval = std::max<int64_t>(1, lhd_clock_ - previous);
+        lhd_interval_ema_[expert] =
+            interval_alpha_ * static_cast<double>(interval) +
+            (1.0 - interval_alpha_) * lhd_interval_ema_[expert];
+      }
+      lhd_last_seen_[expert] = lhd_clock_;
+      lhd_demand_[expert] +=
+          static_cast<double>(counts[index]) / demand_scale_;
+    }
+  }
+
+  double density(int64_t expert) const {
+    const auto demand = lhd_demand_[expert] * demand_scale_;
+    const auto interval = std::max(1.0, lhd_interval_ema_[expert]);
+    const auto previous = lhd_last_seen_[expert];
+    const auto age = previous < 0
+        ? int64_t{1}
+        : std::max<int64_t>(1, lhd_clock_ - previous);
+    return demand /
+        (interval + age_weight_ * static_cast<double>(age));
+  }
+
+  int64_t choose_victim(
+      const std::vector<uint8_t>& protected_expert,
+      const std::vector<double>& markov_scores) const {
+    int64_t best = -1;
+    double best_score = std::numeric_limits<double>::infinity();
+    for (const auto candidate : lru_) {
+      if (protected_expert[candidate]) {
+        continue;
+      }
+      const auto score = density(candidate) *
+          (1.0 + markov_boost_ * markov_scores[candidate]);
+      if (score < best_score) {
+        best = candidate;
+        best_score = score;
+      }
+    }
+    if (best < 0) {
+      throw std::invalid_argument(
+          "ExpertSSD route-cache has no safe victim");
+    }
+    return best;
+  }
+
+  void erase_lru(int64_t expert) {
+    const auto iterator = std::find(lru_.begin(), lru_.end(), expert);
+    if (iterator == lru_.end()) {
+      throw std::invalid_argument(
+          "ExpertSSD route-cache LRU lost a resident expert");
+    }
+    lru_.erase(iterator);
+  }
+
+  void touch(int64_t expert) {
+    erase_lru(expert);
+    lru_.push_back(expert);
+  }
+
+  size_t expert_count_;
+  size_t capacity_;
+  double retention_decay_;
+  double interval_alpha_;
+  double initial_interval_;
+  double age_weight_;
+  double markov_boost_;
+  std::shared_ptr<ExpertSSDMarkovState> markov_;
+  std::vector<int32_t> expert_to_slot_;
+  std::vector<int32_t> down_expert_to_slot_;
+  std::vector<int32_t> free_slots_;
+  std::vector<int32_t> free_down_slots_;
+  std::vector<int64_t> lru_;
+  std::vector<double> retention_scores_;
+  int64_t lhd_clock_{0};
+  double demand_scale_{1.0};
+  std::vector<double> lhd_demand_;
+  std::vector<int64_t> lhd_last_seen_;
+  std::vector<double> lhd_interval_ema_;
+  size_t hits_{0};
+  size_t misses_{0};
+  size_t evictions_{0};
 };
 
 mx::Dtype scalar_to_dtype(Scalar s) {
@@ -562,6 +989,7 @@ void init_ops(nb::module_& m) {
   nb::class_<mx::ExpertSSDIoEventState>(m, "_ExpertSSDIoEventState");
   nb::class_<ScaleXAsyncBatchState>(m, "_ScaleXAsyncBatchState");
   nb::class_<ExpertSSDMarkovState>(m, "_ExpertSSDMarkovState");
+  nb::class_<ExpertSSDRouteCacheState>(m, "_ExpertSSDRouteCacheState");
   m.def(
       "_expert_ssd_markov_state_new",
       [](size_t expert_count, size_t history_limit) {
@@ -607,6 +1035,158 @@ void init_ops(nb::module_& m) {
       "payload"_a,
       nb::sig(
           "def _expert_ssd_markov_restore(state: _ExpertSSDMarkovState, payload: bytes) -> None"));
+  m.def(
+      "_expert_ssd_route_cache_state_new",
+      [](size_t expert_count,
+         size_t capacity,
+         double retention_decay,
+         double interval_alpha,
+         double initial_interval,
+         double age_weight,
+         double markov_boost,
+         std::shared_ptr<ExpertSSDMarkovState> markov) {
+        return std::make_shared<ExpertSSDRouteCacheState>(
+            expert_count,
+            capacity,
+            retention_decay,
+            interval_alpha,
+            initial_interval,
+            age_weight,
+            markov_boost,
+            std::move(markov));
+      },
+      "expert_count"_a,
+      "capacity"_a,
+      "retention_decay"_a,
+      "interval_alpha"_a,
+      "initial_interval"_a,
+      "age_weight"_a,
+      "markov_boost"_a,
+      "markov"_a = nullptr,
+      nb::sig(
+          "def _expert_ssd_route_cache_state_new(expert_count: int, capacity: int, retention_decay: float, interval_alpha: float, initial_interval: float, age_weight: float, markov_boost: float, markov: _ExpertSSDMarkovState | None = None) -> _ExpertSSDRouteCacheState"));
+  m.def(
+      "_expert_ssd_route_cache_restore",
+      [](std::shared_ptr<ExpertSSDRouteCacheState> state,
+         const std::vector<std::pair<int64_t, int64_t>>& expert_slots,
+         const std::vector<std::pair<int64_t, int64_t>>& down_expert_slots,
+         const std::vector<std::pair<int64_t, double>>& retention_scores,
+         int64_t lhd_clock,
+         double demand_scale,
+         const std::vector<double>& demand,
+         const std::vector<int64_t>& last_seen,
+         const std::vector<double>& interval_ema) {
+        if (!state) {
+          throw std::invalid_argument(
+              "ExpertSSD route-cache state is required");
+        }
+        state->restore(
+            expert_slots,
+            down_expert_slots,
+            retention_scores,
+            lhd_clock,
+            demand_scale,
+            demand,
+            last_seen,
+            interval_ema);
+      },
+      "state"_a,
+      "expert_slots"_a,
+      "down_expert_slots"_a,
+      "retention_scores"_a,
+      "lhd_clock"_a,
+      "demand_scale"_a,
+      "demand"_a,
+      "last_seen"_a,
+      "interval_ema"_a,
+      nb::sig(
+          "def _expert_ssd_route_cache_restore(state: _ExpertSSDRouteCacheState, expert_slots: list[tuple[int, int]], down_expert_slots: list[tuple[int, int]], retention_scores: list[tuple[int, float]], lhd_clock: int, demand_scale: float, demand: list[float], last_seen: list[int], interval_ema: list[float]) -> None"));
+  m.def(
+      "_expert_ssd_route_cache_metadata",
+      [](std::shared_ptr<ExpertSSDRouteCacheState> state) {
+        if (!state) {
+          throw std::invalid_argument(
+              "ExpertSSD route-cache state is required");
+        }
+        return state->metadata();
+      },
+      "state"_a,
+      nb::sig(
+          "def _expert_ssd_route_cache_metadata(state: _ExpertSSDRouteCacheState) -> dict"));
+  m.def(
+      "_expert_ssd_route_cache_plan",
+      [](std::shared_ptr<ExpertSSDRouteCacheState> state, mx::array indices) {
+        if (!state || indices.ndim() == 0) {
+          throw std::invalid_argument(
+              "ExpertSSD route-cache state and routed indices are required");
+        }
+        for (auto stride : indices.strides()) {
+          if (stride < 0) {
+            throw std::invalid_argument(
+                "ExpertSSD route-cache negative strides are unsupported");
+          }
+        }
+        ExpertSSDRouteCachePlan plan;
+        {
+          // The planner owns the only host synchronization for this layer.
+          // Release the GIL while upstream Metal work completes and while the
+          // persistent native cache transaction mutates its policy state.
+          nb::gil_scoped_release release;
+          indices.eval();
+          plan = state->plan(indices);
+        }
+        nb::dict output;
+        nb::list unique;
+        nb::dict counts;
+        nb::list routed;
+        nb::list gate_up_rows;
+        nb::list down_rows;
+        nb::list resident_before;
+        nb::list missing;
+        nb::list missing_gate_up_rows;
+        nb::list missing_down_rows;
+        nb::list evicted;
+        for (size_t index = 0; index < plan.unique.size(); ++index) {
+          const auto expert = plan.unique[index];
+          unique.append(nb::cast(expert));
+          counts[nb::cast(expert)] = nb::cast(plan.counts[index]);
+          gate_up_rows.append(nb::cast(plan.gate_up_rows[index]));
+          down_rows.append(nb::cast(plan.down_rows[index]));
+          resident_before.append(nb::cast(bool(plan.resident_before[index])));
+        }
+        for (const auto expert : plan.routed) {
+          routed.append(nb::cast(expert));
+        }
+        for (size_t index = 0; index < plan.missing.size(); ++index) {
+          missing.append(nb::cast(plan.missing[index]));
+          missing_gate_up_rows.append(
+              nb::cast(plan.missing_gate_up_rows[index]));
+          missing_down_rows.append(
+              nb::cast(plan.missing_down_rows[index]));
+        }
+        for (const auto expert : plan.evicted) {
+          evicted.append(nb::cast(expert));
+        }
+        output["unique"] = unique;
+        output["counts"] = counts;
+        output["routed"] = routed;
+        output["compact"] = mx::array(
+            plan.compact.begin(), indices.shape(), indices.dtype());
+        output["gate_up_rows"] = gate_up_rows;
+        output["down_rows"] = down_rows;
+        output["resident_before"] = resident_before;
+        output["missing"] = missing;
+        output["missing_gate_up_rows"] = missing_gate_up_rows;
+        output["missing_down_rows"] = missing_down_rows;
+        output["evicted"] = evicted;
+        output["hits"] = plan.hits;
+        output["misses"] = plan.misses;
+        return output;
+      },
+      "state"_a,
+      "indices"_a,
+      nb::sig(
+          "def _expert_ssd_route_cache_plan(state: _ExpertSSDRouteCacheState, indices: array) -> dict"));
   m.def(
       "_expert_ssd_io_event_state_new",
       []() { return mx::expert_ssd_io_event_state_new(); },
