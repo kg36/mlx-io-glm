@@ -735,6 +735,33 @@ void init_ops(nb::module_& m) {
       nb::sig(
           "def _expert_ssd_scalex_mxfp4_qmv_split_routes(x: array, weight: array, scale_records: array, weight_routes: array, scale_routes: array, projection: int) -> array"));
   m.def(
+      "_expert_ssd_scalex_mxfp4_width2_down_reduce",
+      [](const mx::array& x,
+         const mx::array& weight,
+         const mx::array& scale_records,
+         const mx::array& weight_routes,
+         const mx::array& scale_routes,
+         const mx::array& scores,
+         const mx::array& shared) {
+        return mx::expert_ssd_scalex_mxfp4_width2_down_reduce(
+            x,
+            weight,
+            scale_records,
+            weight_routes,
+            scale_routes,
+            scores,
+            shared);
+      },
+      "x"_a,
+      "weight"_a,
+      "scale_records"_a,
+      "weight_routes"_a,
+      "scale_routes"_a,
+      "scores"_a,
+      "shared"_a,
+      nb::sig(
+          "def _expert_ssd_scalex_mxfp4_width2_down_reduce(x: array, weight: array, scale_records: array, weight_routes: array, scale_routes: array, scores: array, shared: array) -> array"));
+  m.def(
       "_expert_ssd_route_plan",
       &official_direct_route_plan,
       "indices"_a,
@@ -897,6 +924,29 @@ void init_ops(nb::module_& m) {
       nb::sig(
           "def _scalex_mode_a_advise_read(direct: _ScaleXModeADirect, expert_id: int, total_bytes: int) -> int"));
   m.def(
+      "_scalex_mode_a_advise_read_many",
+      [](std::shared_ptr<mx::ScaleXModeADirect> direct,
+         const std::vector<size_t>& expert_ids,
+         const std::vector<size_t>& total_bytes) {
+        if (!direct || expert_ids.size() != total_bytes.size()) {
+          throw std::invalid_argument(
+              "[_scalex_mode_a_advise_read_many] invalid batch");
+        }
+        std::vector<size_t> advised;
+        advised.reserve(expert_ids.size());
+        nb::gil_scoped_release release;
+        for (size_t index = 0; index < expert_ids.size(); ++index) {
+          advised.push_back(
+              direct->advise_read(expert_ids[index], total_bytes[index]));
+        }
+        return advised;
+      },
+      "direct"_a,
+      "expert_ids"_a,
+      "total_bytes"_a,
+      nb::sig(
+          "def _scalex_mode_a_advise_read_many(direct: _ScaleXModeADirect, expert_ids: list[int], total_bytes: list[int]) -> list[int]"));
+  m.def(
       "_scalex_mode_a_page_residency",
       [](std::shared_ptr<mx::ScaleXModeADirect> direct,
          size_t expert_id,
@@ -988,6 +1038,26 @@ void init_ops(nb::module_& m) {
         Ask macOS to asynchronously warm the expert's source ranges in the
         file cache without copying bytes into a Metal-visible destination.
       )pbdoc");
+  m.def(
+      "_expert_safetensors_direct_advise_read_many",
+      [](std::shared_ptr<mx::ExpertSafetensorsDirect> direct,
+         const std::vector<size_t>& expert_ids) {
+        if (!direct) {
+          throw std::invalid_argument(
+              "[_expert_safetensors_direct_advise_read_many] direct handle is null");
+        }
+        std::vector<size_t> advised;
+        advised.reserve(expert_ids.size());
+        nb::gil_scoped_release release;
+        for (const auto expert_id : expert_ids) {
+          advised.push_back(direct->advise_read(expert_id));
+        }
+        return advised;
+      },
+      "direct"_a,
+      "expert_ids"_a,
+      nb::sig(
+          "def _expert_safetensors_direct_advise_read_many(direct: _ExpertSafetensorsDirect, expert_ids: list[int]) -> list[int]"));
   m.def(
       "_expert_ssd_direct_load_into",
       [](std::shared_ptr<mx::ExpertSafetensorsDirect> direct,
