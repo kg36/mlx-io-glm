@@ -93,4 +93,16 @@ MLX_API array expert_ssd_scalex_mxfp4_qmv_split_routes(
     uint32_t projection,
     StreamOrDevice s = {});
 
+// Fixed width-two/top-six ScaleX Down QMV with exact BF16 route-score
+// reduction and shared-expert addition in the same Metal dispatch.
+MLX_API array expert_ssd_scalex_mxfp4_width2_down_reduce(
+    const array& x,
+    const array& weight,
+    const array& scale_records,
+    const array& weight_routes,
+    const array& scale_routes,
+    const array& scores,
+    const array& shared,
+    StreamOrDevice s = {});
+
 } // namespace mlx::core

@@ -347,6 +347,145 @@ METAL_FUNC void dsv4_scalex_qmv_fast_impl(
       simd_lid);
 }
 
+// Fixed width-two/top-six Down projection with the exact BF16 score-reduction
+// order and shared-expert add folded into the same dispatch. This avoids
+// materializing the 12x4096 routed Down tensor on all-hit verifier layers.
+[[kernel]] void dsv4_scalex_mxfp4_width2_down_reduce_bf16(
+    const device uint32_t* weight [[buffer(0)]],
+    const device uint8_t* scale_records [[buffer(1)]],
+    const device bfloat16_t* x [[buffer(2)]],
+    const device uint32_t* weight_routes [[buffer(3)]],
+    const device uint32_t* scale_routes [[buffer(4)]],
+    const device float* scores [[buffer(5)]],
+    const device bfloat16_t* shared [[buffer(6)]],
+    device bfloat16_t* output [[buffer(7)]],
+    const constant int& in_vec_size [[buffer(8)]],
+    const constant int& out_vec_size [[buffer(9)]],
+    const constant int& record_stride [[buffer(10)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int packs_per_thread = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int pack_factor = get_pack_factor<32, 4>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<32>();
+  constexpr int values_per_thread = pack_factor * packs_per_thread;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int scale_step_per_thread = 32 / values_per_thread;
+  constexpr uint topk = 6u;
+  threadgroup uint8_t scale_tile[1024];
+
+  const uint token = tid.z;
+  const int out_row = tid.y * 8 + simd_gid * results_per_simdgroup;
+  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = in_vec_size / 32;
+  const ulong weight_stride = ulong(out_vec_size) * ulong(in_vec_size_w);
+  const uint scale_count = uint(out_vec_size * in_vec_size_g);
+  thread bfloat16_t total[results_per_simdgroup] = {
+      bfloat16_t(0.0f), bfloat16_t(0.0f),
+      bfloat16_t(0.0f), bfloat16_t(0.0f)};
+
+  for (uint expert = 0; expert < topk; ++expert) {
+    const uint route_position = token * topk + expert;
+    const uint weight_slot = weight_routes[route_position];
+    const uint scale_slot = scale_routes[route_position];
+    const device uint8_t* record =
+        scale_records + ulong(scale_slot) * ulong(record_stride);
+    const uint codec = uint(record[4]);
+    const uint primary_size = dsv4_scalex_load_u32(record + 16);
+    const uint exception_count = dsv4_scalex_load_u32(record + 20);
+    const device uint8_t* primary = record + 24;
+    const device uint8_t* positions = primary + primary_size;
+    const device uint8_t* exception_values =
+        positions + ulong(exception_count) * 4ul;
+    const uint encoded_size = 24u + primary_size + 5u * exception_count;
+    const device uint8_t* tile_prefix =
+        record + ((encoded_size + 1u) & ~1u);
+    threadgroup uint8_t* local_scales =
+        scale_tile + simd_gid * 512u;
+    const uint group_start = scale_count + uint(out_row * in_vec_size_g);
+    const uint group_scale_count =
+        uint(results_per_simdgroup * in_vec_size_g);
+
+    uint exception_range = 0;
+    if (simd_lid == 0u) {
+      exception_range =
+          dsv4_scalex_load_u32(tile_prefix + 2u * (group_start >> 9));
+    }
+    exception_range = simd_shuffle(exception_range, ushort(0));
+    const uint exception_begin = exception_range & 0xffffu;
+    const uint exception_end = exception_range >> 16;
+    if (codec == 1u) {
+      const uint8_t palette0 = record[5];
+      const uint8_t palette1 = record[6];
+      for (uint local = simd_lid; local < group_scale_count;
+           local += SIMD_SIZE) {
+        const uint raw_index = group_start + local;
+        const uint code =
+            (uint(primary[raw_index >> 3]) >> (raw_index & 7u)) & 1u;
+        local_scales[local] = code == 0u ? palette0 : palette1;
+      }
+    } else {
+      for (uint local = simd_lid; local < group_scale_count;
+           local += SIMD_SIZE) {
+        local_scales[local] = dsv4_scalex_primary_value(
+            record, primary, codec, group_start + local);
+      }
+    }
+    for (uint index = exception_begin + simd_lid;
+         index < exception_end; index += SIMD_SIZE) {
+      const uint position =
+          dsv4_scalex_load_u32(positions + ulong(index) * 4ul);
+      const uint local = position - group_start;
+      if (local < group_scale_count) {
+        local_scales[local] = exception_values[index];
+      }
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    const device uint8_t* ws =
+        reinterpret_cast<const device uint8_t*>(weight) +
+        ulong(weight_slot) * weight_stride +
+        ulong(out_row * in_vec_size_w +
+              simd_lid * packs_per_thread * bytes_per_pack);
+    const device bfloat16_t* route_x =
+        x + ulong(route_position) * ulong(in_vec_size) +
+        ulong(simd_lid * values_per_thread);
+    thread float result[results_per_simdgroup] = {0};
+    thread float x_thread[values_per_thread];
+    for (int k = 0; k < in_vec_size; k += block_size) {
+      load_vector<bfloat16_t, float, values_per_thread>(route_x, x_thread);
+      const uint scale_group =
+          uint(simd_lid / scale_step_per_thread + k / 32);
+      for (int row = 0; row < results_per_simdgroup; ++row) {
+        result[row] += qdot<float, values_per_thread, 4>(
+            ws + row * in_vec_size_w,
+            x_thread,
+            dequantize_scale<float, 32>(
+                local_scales[uint(row) * uint(in_vec_size_g) + scale_group]));
+      }
+      ws += block_size * bytes_per_pack / pack_factor;
+      route_x += block_size;
+    }
+    const bfloat16_t score = bfloat16_t(scores[route_position]);
+    for (int row = 0; row < results_per_simdgroup; ++row) {
+      const bfloat16_t down = bfloat16_t(simd_sum(result[row]));
+      const bfloat16_t product =
+          bfloat16_t(float(down) * float(score));
+      total[row] = bfloat16_t(float(total[row]) + float(product));
+    }
+  }
+
+  if (simd_lid == 0u) {
+    for (int row = 0; row < results_per_simdgroup; ++row) {
+      const ulong offset =
+          ulong(token) * ulong(out_vec_size) + ulong(out_row + row);
+      output[offset] =
+          bfloat16_t(float(total[row]) + float(shared[offset]));
+    }
+  }
+}
+
 #define instantiate_quantized(mode, name, type, group_size, bits) \
   instantiate_kernel( \
       #mode "_" #name "_" #type "_gs_" #group_size "_b_" #bits, \
