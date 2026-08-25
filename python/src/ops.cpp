@@ -458,6 +458,61 @@ class ExpertSSDRouteCacheState {
     return output;
   }
 
+  void replay_all_hit_routes(
+      const std::vector<std::vector<int64_t>>& routes) {
+    for (const auto& routed : routes) {
+      if (routed.empty()) {
+        throw std::invalid_argument(
+            "ExpertSSD deferred all-hit route cannot be empty");
+      }
+      std::vector<int64_t> unique;
+      std::vector<int32_t> counts;
+      unique.reserve(routed.size());
+      counts.reserve(routed.size());
+      std::unordered_map<int64_t, int32_t> compact_ids;
+      compact_ids.reserve(std::min<size_t>(routed.size(), expert_count_));
+      for (const auto expert : routed) {
+        validate_expert(expert);
+        auto [iterator, inserted] = compact_ids.emplace(
+            expert, static_cast<int32_t>(unique.size()));
+        if (inserted) {
+          unique.push_back(expert);
+          counts.push_back(0);
+        }
+        counts[iterator->second] += 1;
+      }
+      if (unique.size() > capacity_) {
+        throw std::invalid_argument(
+            "ExpertSSD deferred route exceeds native cache capacity");
+      }
+      for (const auto expert : unique) {
+        if (expert_to_slot_[expert] < 0 ||
+            down_expert_to_slot_[expert] < 0) {
+          throw std::invalid_argument(
+              "ExpertSSD deferred route is no longer all-hit");
+        }
+      }
+
+      // Reproduce the policy-only portion of plan() exactly, in original
+      // route order.  There is deliberately no result construction or Python
+      // boxing here: all physical row maps remain unchanged.
+      std::vector<int64_t> resident_before;
+      resident_before.reserve(lru_.size());
+      for (const auto expert : lru_) {
+        resident_before.push_back(expert);
+      }
+      decay_retention();
+      if (markov_) {
+        (void)markov_->update_and_score(unique, resident_before);
+      }
+      record_lhd_accesses(unique, counts);
+      for (const auto expert : unique) {
+        touch(expert);
+      }
+      hits_ += unique.size();
+    }
+  }
+
   nb::dict metadata() const {
     nb::dict output;
     nb::list expert_slots;
@@ -1188,6 +1243,21 @@ void init_ops(nb::module_& m) {
       nb::sig(
           "def _expert_ssd_route_cache_plan(state: _ExpertSSDRouteCacheState, indices: array) -> dict"));
   m.def(
+      "_expert_ssd_route_cache_replay_all_hits",
+      [](std::shared_ptr<ExpertSSDRouteCacheState> state,
+         const std::vector<std::vector<int64_t>>& routes) {
+        if (!state) {
+          throw std::invalid_argument(
+              "ExpertSSD route-cache state is required");
+        }
+        nb::gil_scoped_release release;
+        state->replay_all_hit_routes(routes);
+      },
+      "state"_a,
+      "routes"_a,
+      nb::sig(
+          "def _expert_ssd_route_cache_replay_all_hits(state: _ExpertSSDRouteCacheState, routes: list[list[int]]) -> None"));
+  m.def(
       "_expert_ssd_io_event_state_new",
       []() { return mx::expert_ssd_io_event_state_new(); },
       nb::sig(
@@ -1341,6 +1411,56 @@ void init_ops(nb::module_& m) {
       "shared"_a,
       nb::sig(
           "def _expert_ssd_scalex_mxfp4_width2_down_reduce(x: array, weight: array, scale_records: array, weight_routes: array, scale_routes: array, scores: array, shared: array) -> array"));
+  m.def(
+      "_expert_ssd_scalex_conditional_m0",
+      [](const mx::array& indices,
+         const mx::array& x,
+         const mx::array& scores,
+         const mx::array& shared,
+         const mx::array& scale_records,
+         const mx::array& gate_weight,
+         const mx::array& down_weight,
+         const mx::array& up_weight,
+         const mx::array& gate_directory,
+         const mx::array& down_directory,
+         const mx::array& gate_routes_scratch,
+         const mx::array& down_routes_scratch,
+         const mx::array& all_hit_scratch,
+         const mx::array& up_scratch,
+         const mx::array& gate_scratch,
+         const mx::array& activated_scratch,
+         const mx::array& routed_scratch,
+         const mx::array& indirect_scratch,
+         float swiglu_limit) {
+        return mx::expert_ssd_scalex_conditional_m0(
+            indices, x, scores, shared, scale_records, gate_weight,
+            down_weight, up_weight, gate_directory, down_directory,
+            gate_routes_scratch, down_routes_scratch, all_hit_scratch,
+            up_scratch, gate_scratch, activated_scratch, routed_scratch,
+            indirect_scratch,
+            swiglu_limit);
+      },
+      "indices"_a,
+      "x"_a,
+      "scores"_a,
+      "shared"_a,
+      "scale_records"_a,
+      "gate_weight"_a,
+      "down_weight"_a,
+      "up_weight"_a,
+      "gate_directory"_a,
+      "down_directory"_a,
+      "gate_routes_scratch"_a,
+      "down_routes_scratch"_a,
+      "all_hit_scratch"_a,
+      "up_scratch"_a,
+      "gate_scratch"_a,
+      "activated_scratch"_a,
+      "routed_scratch"_a,
+      "indirect_scratch"_a,
+      "swiglu_limit"_a = 10.0f,
+      nb::sig(
+          "def _expert_ssd_scalex_conditional_m0(indices: array, x: array, scores: array, shared: array, scale_records: array, gate_weight: array, down_weight: array, up_weight: array, gate_directory: array, down_directory: array, gate_routes_scratch: array, down_routes_scratch: array, all_hit_scratch: array, up_scratch: array, gate_scratch: array, activated_scratch: array, routed_scratch: array, indirect_scratch: array, swiglu_limit: float = 10.0) -> array"));
   m.def(
       "_expert_ssd_route_plan",
       &official_direct_route_plan,
