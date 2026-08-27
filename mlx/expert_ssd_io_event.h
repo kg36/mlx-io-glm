@@ -61,6 +61,29 @@ MLX_API std::vector<array> expert_ssd_mxfp4_pair_qmv(
     const array& routes,
     StreamOrDevice s = {});
 
+// One dense MXFP4 weight applied to exactly two BF16 rows. The two QMV
+// reductions remain independent and width-one-ordered inside one dispatch.
+MLX_API array expert_ssd_mxfp4_two_row_qmv(
+    const array& x,
+    const array& weight,
+    const array& scales,
+    StreamOrDevice s = {});
+
+// Batched-weight form used by attention MultiLinear output groups.
+MLX_API array expert_ssd_mxfp4_grouped_two_row_qmv(
+    const array& x,
+    const array& weight,
+    const array& scales,
+    StreamOrDevice s = {});
+
+// Apply one row-major matrix to exactly two BF16 or FP32 vectors using the
+// same GEMV specialization and reduction order selected by width-one matmul.
+// The vectors share one Metal dispatch but remain independent GEMV batches.
+MLX_API array expert_ssd_two_row_gemv(
+    const array& x,
+    const array& weight,
+    StreamOrDevice s = {});
+
 // Exact stock-QMV down projection with 0xffffffff route lanes masked to zero.
 MLX_API array expert_ssd_mxfp4_masked_qmv(
     const array& x,
@@ -103,6 +126,31 @@ MLX_API array expert_ssd_scalex_mxfp4_width2_down_reduce(
     const array& scale_routes,
     const array& scores,
     const array& shared,
+    StreamOrDevice s = {});
+
+// Exact optimistic all-hit ScaleX MoE. Router IDs and slot lookup stay on the
+// GPU; misses disable the resident continuation through indirect dispatches.
+// The existing host cache transaction remains authoritative for selection.
+MLX_API array expert_ssd_scalex_conditional_m0(
+    const array& indices,
+    const array& x,
+    const array& scores,
+    const array& shared,
+    const array& scale_records,
+    const array& gate_weight,
+    const array& down_weight,
+    const array& up_weight,
+    const array& gate_directory,
+    const array& down_directory,
+    const array& gate_routes_scratch,
+    const array& down_routes_scratch,
+    const array& all_hit_scratch,
+    const array& up_scratch,
+    const array& gate_scratch,
+    const array& activated_scratch,
+    const array& routed_scratch,
+    const array& indirect_scratch,
+    float swiglu_limit = 10.0f,
     StreamOrDevice s = {});
 
 } // namespace mlx::core

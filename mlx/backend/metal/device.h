@@ -47,6 +47,7 @@ class MLX_API CommandEncoder {
   };
 
   void set_buffer(const MTL::Buffer* buf, int idx, int64_t offset = 0);
+  void register_input_array(const array& a);
   void set_input_array(const array& a, int idx, int64_t offset = 0);
   void set_output_array(array& a, int idx, int64_t offset = 0);
   void register_output_array(const array& a);
@@ -55,6 +56,10 @@ class MLX_API CommandEncoder {
   void add_temporaries(std::vector<array> arrays);
 
   void dispatch_threadgroups(MTL::Size grid_dims, MTL::Size group_dims);
+  void dispatch_threadgroups(
+      const array& indirect_dims,
+      size_t byte_offset,
+      MTL::Size group_dims);
   void dispatch_threads(MTL::Size grid_dims, MTL::Size group_dims);
   void maybeInsertBarrier();
 
@@ -100,6 +105,14 @@ class MLX_API CommandEncoder {
 
   MTL::CommandBuffer* get_command_buffer() const {
     return buffer_.get();
+  }
+
+  // ExpertSSD fixed islands register their complete resource set up front,
+  // then encode a dependency-closed sequence of existing kernels.  Keeping
+  // that sequence in one raw encoder avoids the generic graph hazard tracker
+  // inserting barriers between every internal stage.
+  MTL::ComputeCommandEncoder* expert_ssd_raw_compute_encoder() {
+    return get_command_encoder();
   }
 
  private:

@@ -414,10 +414,7 @@ void CommandEncoder::set_buffer(
   get_command_encoder()->setBuffer(buf, offset, idx);
 }
 
-void CommandEncoder::set_input_array(
-    const array& a,
-    int idx,
-    int64_t offset /* = 0 */) {
+void CommandEncoder::register_input_array(const array& a) {
   if (all_inputs_.insert(a.buffer().ptr()).second) {
     buffer_sizes_ += a.data_size();
   }
@@ -425,6 +422,13 @@ void CommandEncoder::set_input_array(
   next_inputs_.insert(r_buf);
   needs_barrier_ =
       needs_barrier_ | (prev_outputs_.find(r_buf) != prev_outputs_.end());
+}
+
+void CommandEncoder::set_input_array(
+    const array& a,
+    int idx,
+    int64_t offset /* = 0 */) {
+  register_input_array(a);
   auto a_buf = static_cast<const MTL::Buffer*>(a.buffer().ptr());
   get_command_encoder()->setBuffer(a_buf, a.offset() + offset, idx);
 }
@@ -485,6 +489,21 @@ void CommandEncoder::dispatch_threadgroups(
     profile_dispatch_threadgroups.fetch_add(1, std::memory_order_relaxed);
   }
   get_command_encoder()->dispatchThreadgroups(grid_dims, group_dims);
+}
+
+void CommandEncoder::dispatch_threadgroups(
+    const array& indirect_dims,
+    size_t byte_offset,
+    MTL::Size group_dims) {
+  register_input_array(indirect_dims);
+  maybeInsertBarrier();
+  buffer_ops_++;
+  if (profile_counters_enabled()) {
+    profile_dispatch_threadgroups.fetch_add(1, std::memory_order_relaxed);
+  }
+  auto* buffer = static_cast<const MTL::Buffer*>(indirect_dims.buffer().ptr());
+  get_command_encoder()->dispatchThreadgroups(
+      buffer, indirect_dims.offset() + byte_offset, group_dims);
 }
 
 void CommandEncoder::dispatch_threads(

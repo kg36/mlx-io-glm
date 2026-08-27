@@ -215,6 +215,125 @@ METAL_FUNC void dsv4_scalex_qmv_fast_impl(
       simd_lid);
 }
 
+// Two independent width-one projections sharing one dispatch. Each row
+// enters fp_qmv_fast_impl with tid.x == 0, preserving the exact reduction
+// order of two canonical QMV calls while avoiding a width-two GEMM path.
+[[kernel]] void dsv4_mxfp4_two_row_bf16(
+    const device uint32_t* weight [[buffer(0)]],
+    const device uint8_t* scales [[buffer(1)]],
+    const device bfloat16_t* x [[buffer(2)]],
+    device bfloat16_t* output [[buffer(3)]],
+    const constant int& in_vec_size [[buffer(4)]],
+    const constant int& out_vec_size [[buffer(5)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  const uint3 qmv_tid(0u, tid.y, 0u);
+  for (uint row = 0u; row < 2u; ++row) {
+    fp_qmv_fast_impl<bfloat16_t, 32, 4>(
+        weight,
+        scales,
+        x + ulong(row) * ulong(in_vec_size),
+        output + ulong(row) * ulong(out_vec_size),
+        in_vec_size,
+        out_vec_size,
+        qmv_tid,
+        simd_gid,
+        simd_lid);
+  }
+}
+
+// Batched-weight companion for MultiLinear output groups. Grid z selects one
+// independent matrix and its corresponding pair of input rows.
+[[kernel]] void dsv4_mxfp4_grouped_two_row_bf16(
+    const device uint32_t* weight [[buffer(0)]],
+    const device uint8_t* scales [[buffer(1)]],
+    const device bfloat16_t* x [[buffer(2)]],
+    device bfloat16_t* output [[buffer(3)]],
+    const constant int& in_vec_size [[buffer(4)]],
+    const constant int& out_vec_size [[buffer(5)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  const ulong group = ulong(tid.z);
+  const ulong weight_stride =
+      ulong(out_vec_size) * ulong(in_vec_size / 8);
+  const ulong scale_stride =
+      ulong(out_vec_size) * ulong(in_vec_size / 32);
+  const ulong input_stride = 2ul * ulong(in_vec_size);
+  const ulong output_stride = 2ul * ulong(out_vec_size);
+  const uint3 qmv_tid(0u, tid.y, 0u);
+  for (uint row = 0u; row < 2u; ++row) {
+    fp_qmv_fast_impl<bfloat16_t, 32, 4>(
+        weight + group * weight_stride,
+        scales + group * scale_stride,
+        x + group * input_stride + ulong(row) * ulong(in_vec_size),
+        output + group * output_stride + ulong(row) * ulong(out_vec_size),
+        in_vec_size,
+        out_vec_size,
+        qmv_tid,
+        simd_gid,
+        simd_lid);
+  }
+}
+
+[[kernel]] void dsv4_mxfp4_two_row_f32(
+    const device uint32_t* weight [[buffer(0)]],
+    const device uint8_t* scales [[buffer(1)]],
+    const device float* x [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    const constant int& in_vec_size [[buffer(4)]],
+    const constant int& out_vec_size [[buffer(5)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  const uint3 qmv_tid(0u, tid.y, 0u);
+  for (uint row = 0u; row < 2u; ++row) {
+    fp_qmv_fast_impl<float, 32, 4>(
+        weight,
+        scales,
+        x + ulong(row) * ulong(in_vec_size),
+        output + ulong(row) * ulong(out_vec_size),
+        in_vec_size,
+        out_vec_size,
+        qmv_tid,
+        simd_gid,
+        simd_lid);
+  }
+}
+
+[[kernel]] void dsv4_mxfp4_grouped_two_row_f32(
+    const device uint32_t* weight [[buffer(0)]],
+    const device uint8_t* scales [[buffer(1)]],
+    const device float* x [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    const constant int& in_vec_size [[buffer(4)]],
+    const constant int& out_vec_size [[buffer(5)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  const ulong group = ulong(tid.z);
+  const ulong weight_stride =
+      ulong(out_vec_size) * ulong(in_vec_size / 8);
+  const ulong scale_stride =
+      ulong(out_vec_size) * ulong(in_vec_size / 32);
+  const ulong input_stride = 2ul * ulong(in_vec_size);
+  const ulong output_stride = 2ul * ulong(out_vec_size);
+  const uint3 qmv_tid(0u, tid.y, 0u);
+  for (uint row = 0u; row < 2u; ++row) {
+    fp_qmv_fast_impl<float, 32, 4>(
+        weight + group * weight_stride,
+        scales + group * scale_stride,
+        x + group * input_stride + ulong(row) * ulong(in_vec_size),
+        output + group * output_stride + ulong(row) * ulong(out_vec_size),
+        in_vec_size,
+        out_vec_size,
+        qmv_tid,
+        simd_gid,
+        simd_lid);
+  }
+}
+
 [[kernel]] void dsv4_mxfp4_masked_down_bf16(
     const device uint32_t* weight [[buffer(0)]],
     const device uint8_t* scales [[buffer(1)]],
@@ -484,6 +603,140 @@ METAL_FUNC void dsv4_scalex_qmv_fast_impl(
           bfloat16_t(float(total[row]) + float(shared[offset]));
     }
   }
+}
+
+// GPU-only M0 selector. The current authoritative slot directories are read
+// without materializing router IDs on the host. A miss writes zero-sized
+// indirect dispatches; an all-hit route enables the fixed resident graph.
+[[kernel]] void dsv4_scalex_m0_map_indirect(
+    const device int32_t* expert_ids [[buffer(0)]],
+    const device int32_t* gate_directory [[buffer(1)]],
+    const device int32_t* down_directory [[buffer(2)]],
+    device uint32_t* gate_routes [[buffer(3)]],
+    device uint32_t* down_routes [[buffer(4)]],
+    device int32_t* all_hit_status [[buffer(5)]],
+    device uint* indirect_threadgroups [[buffer(6)]],
+    const constant uint& route_count [[buffer(7)]],
+    const constant uint& expert_count [[buffer(8)]],
+    const constant uint& width [[buffer(9)]],
+    uint index [[thread_position_in_grid]]) {
+  if (index < route_count) {
+    const int32_t expert = expert_ids[index];
+    const bool valid = expert >= 0 && uint(expert) < expert_count;
+    const int32_t gate_slot = valid ? gate_directory[expert] : -1;
+    const int32_t down_slot = valid ? down_directory[expert] : -1;
+    gate_routes[index] = gate_slot >= 0 ? uint(gate_slot) : 0xffffffffu;
+    down_routes[index] = down_slot >= 0 ? uint(down_slot) : 0xffffffffu;
+  }
+  if (index == 0u) {
+    bool all_hit = true;
+    for (uint route = 0u; route < route_count; ++route) {
+      const int32_t expert = expert_ids[route];
+      const bool valid = expert >= 0 && uint(expert) < expert_count;
+      all_hit = all_hit && valid && gate_directory[expert] >= 0 &&
+          down_directory[expert] >= 0;
+    }
+    all_hit_status[0] = all_hit ? 1 : 0;
+    const uint enabled = all_hit ? 1u : 0u;
+    for (uint position = 0u; position < width; ++position) {
+      const uint base = position * 3u;
+      indirect_threadgroups[base] = enabled;
+      indirect_threadgroups[base + 1u] = 256u;
+      indirect_threadgroups[base + 2u] = 6u;
+    }
+    uint base = width * 3u;
+    indirect_threadgroups[base] =
+        enabled * ((route_count * 2048u + 255u) / 256u);
+    indirect_threadgroups[base + 1u] = 1u;
+    indirect_threadgroups[base + 2u] = 1u;
+    base += 3u;
+    indirect_threadgroups[base] = enabled;
+    indirect_threadgroups[base + 1u] = 512u;
+    indirect_threadgroups[base + 2u] = width == 2u ? 2u : route_count;
+    base += 3u;
+    indirect_threadgroups[base] = width == 1u ? enabled * 16u : 0u;
+    indirect_threadgroups[base + 1u] = 1u;
+    indirect_threadgroups[base + 2u] = 1u;
+  }
+}
+
+[[kernel]] void dsv4_scalex_m0_pair_qmv_sparse_bf16(
+    const device uint32_t* up_weight [[buffer(0)]],
+    const device uint32_t* gate_weight [[buffer(1)]],
+    const device uint8_t* scale_records [[buffer(2)]],
+    const device bfloat16_t* x [[buffer(3)]],
+    const device uint32_t* routes [[buffer(4)]],
+    device bfloat16_t* up_output [[buffer(5)]],
+    device bfloat16_t* gate_output [[buffer(6)]],
+    const constant int& in_vec_size [[buffer(7)]],
+    const constant int& out_vec_size [[buffer(8)]],
+    const constant int& record_stride [[buffer(9)]],
+    const constant uint& route_count [[buffer(10)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  threadgroup uint8_t scale_tile[1024];
+  const uint route_position = tid.z;
+  if (route_position >= route_count) return;
+  const uint slot = routes[route_position];
+  if (slot == 0xffffffffu) return;
+  const ulong weight_stride =
+      ulong(out_vec_size) * ulong(in_vec_size / 8);
+  const uint scale_count = uint(out_vec_size * (in_vec_size / 32));
+  const device uint8_t* record =
+      scale_records + ulong(slot) * ulong(record_stride);
+  const uint3 qmv_tid(0u, tid.y, 0u);
+  dsv4_scalex_qmv_fast_impl<bfloat16_t, 32, 4>(
+      up_weight + ulong(slot) * weight_stride, record,
+      scale_tile + simd_gid * 512u, 2u * scale_count, x,
+      up_output + ulong(route_position) * ulong(out_vec_size),
+      in_vec_size, out_vec_size, qmv_tid, simd_gid, simd_lid);
+  dsv4_scalex_qmv_fast_impl<bfloat16_t, 32, 4>(
+      gate_weight + ulong(slot) * weight_stride, record,
+      scale_tile + simd_gid * 512u, 0u, x,
+      gate_output + ulong(route_position) * ulong(out_vec_size),
+      in_vec_size, out_vec_size, qmv_tid, simd_gid, simd_lid);
+}
+
+[[kernel]] void dsv4_scalex_m0_limited_swiglu_bf16(
+    const device bfloat16_t* up [[buffer(0)]],
+    const device bfloat16_t* gate [[buffer(1)]],
+    const device uint32_t* routes [[buffer(2)]],
+    device bfloat16_t* activated [[buffer(3)]],
+    const constant uint& intermediate [[buffer(4)]],
+    const constant uint& count [[buffer(5)]],
+    const constant float& limit [[buffer(6)]],
+    uint index [[thread_position_in_grid]]) {
+  if (index >= count || routes[index / intermediate] == 0xffffffffu) return;
+  bfloat16_t gate_value = bfloat16_t(min(float(gate[index]), limit));
+  bfloat16_t up_value = bfloat16_t(clamp(float(up[index]), -limit, limit));
+  bfloat16_t y = bfloat16_t(1) /
+      (bfloat16_t(1) + metal::fast::exp(metal::abs(gate_value)));
+  bfloat16_t sigmoid = gate_value < bfloat16_t(0)
+      ? y : bfloat16_t(1) - y;
+  // nn.silu is a separately compiled BF16 operation in the product graph.
+  // Preserve its storage/rounding boundary before the outer multiply by Up.
+  bfloat16_t silu = bfloat16_t(gate_value * sigmoid);
+  activated[index] = bfloat16_t(silu * up_value);
+}
+
+[[kernel]] void dsv4_scalex_m0_score_reduce_shared_bf16(
+    const device bfloat16_t* routed [[buffer(0)]],
+    const device float* scores [[buffer(1)]],
+    const device bfloat16_t* shared [[buffer(2)]],
+    device bfloat16_t* combined [[buffer(3)]],
+    const constant uint& hidden [[buffer(4)]],
+    const constant uint& top_k [[buffer(5)]],
+    uint dimension [[thread_position_in_grid]]) {
+  if (dimension >= hidden) return;
+  bfloat16_t total = bfloat16_t(0.0f);
+  for (uint expert = 0u; expert < top_k; ++expert) {
+    const bfloat16_t score = bfloat16_t(scores[expert]);
+    const bfloat16_t product = bfloat16_t(
+        routed[ulong(expert) * ulong(hidden) + dimension] * score);
+    total = bfloat16_t(total + product);
+  }
+  combined[dimension] = bfloat16_t(total + shared[dimension]);
 }
 
 #define instantiate_quantized(mode, name, type, group_size, bits) \
