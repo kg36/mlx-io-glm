@@ -1331,6 +1331,39 @@ void init_ops(nb::module_& m) {
       nb::sig(
           "def _expert_ssd_mxfp4_pair_qmv(x: array, up_weight: array, up_scales: array, gate_weight: array, gate_scales: array, routes: array) -> list[array]"));
   m.def(
+      "_expert_ssd_mxfp4_two_row_qmv",
+      [](const mx::array& x,
+         const mx::array& weight,
+         const mx::array& scales) {
+        return mx::expert_ssd_mxfp4_two_row_qmv(x, weight, scales);
+      },
+      "x"_a,
+      "weight"_a,
+      "scales"_a,
+      nb::sig(
+          "def _expert_ssd_mxfp4_two_row_qmv(x: array, weight: array, scales: array) -> array"));
+  m.def(
+      "_expert_ssd_mxfp4_grouped_two_row_qmv",
+      [](const mx::array& x,
+         const mx::array& weight,
+         const mx::array& scales) {
+        return mx::expert_ssd_mxfp4_grouped_two_row_qmv(x, weight, scales);
+      },
+      "x"_a,
+      "weight"_a,
+      "scales"_a,
+      nb::sig(
+          "def _expert_ssd_mxfp4_grouped_two_row_qmv(x: array, weight: array, scales: array) -> array"));
+  m.def(
+      "_expert_ssd_two_row_gemv",
+      [](const mx::array& x, const mx::array& weight) {
+        return mx::expert_ssd_two_row_gemv(x, weight);
+      },
+      "x"_a,
+      "weight"_a,
+      nb::sig(
+          "def _expert_ssd_two_row_gemv(x: array, weight: array) -> array"));
+  m.def(
       "_expert_ssd_mxfp4_masked_qmv",
       [](const mx::array& x,
          const mx::array& weight,

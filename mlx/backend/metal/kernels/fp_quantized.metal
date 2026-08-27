@@ -215,6 +215,125 @@ METAL_FUNC void dsv4_scalex_qmv_fast_impl(
       simd_lid);
 }
 
+// Two independent width-one projections sharing one dispatch. Each row
+// enters fp_qmv_fast_impl with tid.x == 0, preserving the exact reduction
+// order of two canonical QMV calls while avoiding a width-two GEMM path.
+[[kernel]] void dsv4_mxfp4_two_row_bf16(
+    const device uint32_t* weight [[buffer(0)]],
+    const device uint8_t* scales [[buffer(1)]],
+    const device bfloat16_t* x [[buffer(2)]],
+    device bfloat16_t* output [[buffer(3)]],
+    const constant int& in_vec_size [[buffer(4)]],
+    const constant int& out_vec_size [[buffer(5)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  const uint3 qmv_tid(0u, tid.y, 0u);
+  for (uint row = 0u; row < 2u; ++row) {
+    fp_qmv_fast_impl<bfloat16_t, 32, 4>(
+        weight,
+        scales,
+        x + ulong(row) * ulong(in_vec_size),
+        output + ulong(row) * ulong(out_vec_size),
+        in_vec_size,
+        out_vec_size,
+        qmv_tid,
+        simd_gid,
+        simd_lid);
+  }
+}
+
+// Batched-weight companion for MultiLinear output groups. Grid z selects one
+// independent matrix and its corresponding pair of input rows.
+[[kernel]] void dsv4_mxfp4_grouped_two_row_bf16(
+    const device uint32_t* weight [[buffer(0)]],
+    const device uint8_t* scales [[buffer(1)]],
+    const device bfloat16_t* x [[buffer(2)]],
+    device bfloat16_t* output [[buffer(3)]],
+    const constant int& in_vec_size [[buffer(4)]],
+    const constant int& out_vec_size [[buffer(5)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  const ulong group = ulong(tid.z);
+  const ulong weight_stride =
+      ulong(out_vec_size) * ulong(in_vec_size / 8);
+  const ulong scale_stride =
+      ulong(out_vec_size) * ulong(in_vec_size / 32);
+  const ulong input_stride = 2ul * ulong(in_vec_size);
+  const ulong output_stride = 2ul * ulong(out_vec_size);
+  const uint3 qmv_tid(0u, tid.y, 0u);
+  for (uint row = 0u; row < 2u; ++row) {
+    fp_qmv_fast_impl<bfloat16_t, 32, 4>(
+        weight + group * weight_stride,
+        scales + group * scale_stride,
+        x + group * input_stride + ulong(row) * ulong(in_vec_size),
+        output + group * output_stride + ulong(row) * ulong(out_vec_size),
+        in_vec_size,
+        out_vec_size,
+        qmv_tid,
+        simd_gid,
+        simd_lid);
+  }
+}
+
+[[kernel]] void dsv4_mxfp4_two_row_f32(
+    const device uint32_t* weight [[buffer(0)]],
+    const device uint8_t* scales [[buffer(1)]],
+    const device float* x [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    const constant int& in_vec_size [[buffer(4)]],
+    const constant int& out_vec_size [[buffer(5)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  const uint3 qmv_tid(0u, tid.y, 0u);
+  for (uint row = 0u; row < 2u; ++row) {
+    fp_qmv_fast_impl<float, 32, 4>(
+        weight,
+        scales,
+        x + ulong(row) * ulong(in_vec_size),
+        output + ulong(row) * ulong(out_vec_size),
+        in_vec_size,
+        out_vec_size,
+        qmv_tid,
+        simd_gid,
+        simd_lid);
+  }
+}
+
+[[kernel]] void dsv4_mxfp4_grouped_two_row_f32(
+    const device uint32_t* weight [[buffer(0)]],
+    const device uint8_t* scales [[buffer(1)]],
+    const device float* x [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    const constant int& in_vec_size [[buffer(4)]],
+    const constant int& out_vec_size [[buffer(5)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  const ulong group = ulong(tid.z);
+  const ulong weight_stride =
+      ulong(out_vec_size) * ulong(in_vec_size / 8);
+  const ulong scale_stride =
+      ulong(out_vec_size) * ulong(in_vec_size / 32);
+  const ulong input_stride = 2ul * ulong(in_vec_size);
+  const ulong output_stride = 2ul * ulong(out_vec_size);
+  const uint3 qmv_tid(0u, tid.y, 0u);
+  for (uint row = 0u; row < 2u; ++row) {
+    fp_qmv_fast_impl<float, 32, 4>(
+        weight + group * weight_stride,
+        scales + group * scale_stride,
+        x + group * input_stride + ulong(row) * ulong(in_vec_size),
+        output + group * output_stride + ulong(row) * ulong(out_vec_size),
+        in_vec_size,
+        out_vec_size,
+        qmv_tid,
+        simd_gid,
+        simd_lid);
+  }
+}
+
 [[kernel]] void dsv4_mxfp4_masked_down_bf16(
     const device uint32_t* weight [[buffer(0)]],
     const device uint8_t* scales [[buffer(1)]],

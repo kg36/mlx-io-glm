@@ -61,6 +61,29 @@ MLX_API std::vector<array> expert_ssd_mxfp4_pair_qmv(
     const array& routes,
     StreamOrDevice s = {});
 
+// One dense MXFP4 weight applied to exactly two BF16 rows. The two QMV
+// reductions remain independent and width-one-ordered inside one dispatch.
+MLX_API array expert_ssd_mxfp4_two_row_qmv(
+    const array& x,
+    const array& weight,
+    const array& scales,
+    StreamOrDevice s = {});
+
+// Batched-weight form used by attention MultiLinear output groups.
+MLX_API array expert_ssd_mxfp4_grouped_two_row_qmv(
+    const array& x,
+    const array& weight,
+    const array& scales,
+    StreamOrDevice s = {});
+
+// Apply one row-major matrix to exactly two BF16 or FP32 vectors using the
+// same GEMV specialization and reduction order selected by width-one matmul.
+// The vectors share one Metal dispatch but remain independent GEMV batches.
+MLX_API array expert_ssd_two_row_gemv(
+    const array& x,
+    const array& weight,
+    StreamOrDevice s = {});
+
 // Exact stock-QMV down projection with 0xffffffff route lanes masked to zero.
 MLX_API array expert_ssd_mxfp4_masked_qmv(
     const array& x,

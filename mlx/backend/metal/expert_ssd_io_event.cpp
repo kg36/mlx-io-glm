@@ -3,6 +3,7 @@
 #include <stdexcept>
 
 #include "mlx/backend/metal/device.h"
+#include "mlx/backend/metal/kernels.h"
 #include "mlx/expert_ssd_io_event.h"
 #include "mlx/primitives.h"
 
@@ -131,6 +132,189 @@ class ExpertSSDMXFP4PairQMV : public Primitive {
   }
 
   DEFINE_NAME(ExpertSSDMXFP4PairQMV)
+};
+
+class ExpertSSDMXFP4TwoRowQMV : public Primitive {
+ public:
+  explicit ExpertSSDMXFP4TwoRowQMV(Stream stream) : Primitive(stream) {}
+
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+    throw std::runtime_error(
+        "[ExpertSSDMXFP4TwoRowQMV] CPU evaluation not supported");
+  }
+
+  void eval_gpu(
+      const std::vector<array>& inputs,
+      std::vector<array>& outputs) override {
+    if (inputs.size() != 3 || outputs.size() != 1) {
+      throw std::runtime_error(
+          "[ExpertSSDMXFP4TwoRowQMV] invalid input/output arity");
+    }
+    for (const auto& input : inputs) {
+      if (!input.flags().row_contiguous) {
+        throw std::runtime_error(
+            "[ExpertSSDMXFP4TwoRowQMV] inputs must be row-contiguous");
+      }
+    }
+    auto& output = outputs[0];
+    output.set_data(allocator::malloc(output.nbytes()));
+    const auto& x = inputs[0];
+    const auto& weight = inputs[1];
+    const auto& scales = inputs[2];
+    const int K = x.shape(-1);
+    const int N = weight.shape(-2);
+
+    auto& d = metal::device(stream().device);
+    auto* kernel = d.get_kernel(
+        x.dtype() == bfloat16 ? "dsv4_mxfp4_two_row_bf16"
+                              : "dsv4_mxfp4_two_row_f32");
+    auto& encoder = metal::get_command_encoder(stream());
+    encoder.set_compute_pipeline_state(kernel);
+    int binding = 0;
+    encoder.set_input_array(weight, binding++);
+    encoder.set_input_array(scales, binding++);
+    encoder.set_input_array(x, binding++);
+    encoder.set_output_array(output, binding++);
+    encoder.set_bytes(K, binding++);
+    encoder.set_bytes(N, binding++);
+    encoder.dispatch_threadgroups(
+        MTL::Size(1, N / 8, 1), MTL::Size(32, 2, 1));
+  }
+
+  DEFINE_NAME(ExpertSSDMXFP4TwoRowQMV)
+};
+
+class ExpertSSDMXFP4GroupedTwoRowQMV : public Primitive {
+ public:
+  explicit ExpertSSDMXFP4GroupedTwoRowQMV(Stream stream) : Primitive(stream) {}
+
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+    throw std::runtime_error(
+        "[ExpertSSDMXFP4GroupedTwoRowQMV] CPU evaluation not supported");
+  }
+
+  void eval_gpu(
+      const std::vector<array>& inputs,
+      std::vector<array>& outputs) override {
+    if (inputs.size() != 3 || outputs.size() != 1) {
+      throw std::runtime_error(
+          "[ExpertSSDMXFP4GroupedTwoRowQMV] invalid input/output arity");
+    }
+    for (const auto& input : inputs) {
+      if (!input.flags().row_contiguous) {
+        throw std::runtime_error(
+            "[ExpertSSDMXFP4GroupedTwoRowQMV] inputs must be row-contiguous");
+      }
+    }
+    auto& output = outputs[0];
+    output.set_data(allocator::malloc(output.nbytes()));
+    const auto& x = inputs[0];
+    const auto& weight = inputs[1];
+    const auto& scales = inputs[2];
+    const int K = x.shape(-1);
+    const int N = weight.shape(-2);
+    const int groups = weight.shape(0);
+
+    auto& d = metal::device(stream().device);
+    auto* kernel = d.get_kernel(
+        x.dtype() == bfloat16 ? "dsv4_mxfp4_grouped_two_row_bf16"
+                              : "dsv4_mxfp4_grouped_two_row_f32");
+    auto& encoder = metal::get_command_encoder(stream());
+    encoder.set_compute_pipeline_state(kernel);
+    int binding = 0;
+    encoder.set_input_array(weight, binding++);
+    encoder.set_input_array(scales, binding++);
+    encoder.set_input_array(x, binding++);
+    encoder.set_output_array(output, binding++);
+    encoder.set_bytes(K, binding++);
+    encoder.set_bytes(N, binding++);
+    encoder.dispatch_threadgroups(
+        MTL::Size(1, N / 8, groups), MTL::Size(32, 2, 1));
+  }
+
+  DEFINE_NAME(ExpertSSDMXFP4GroupedTwoRowQMV)
+};
+
+class ExpertSSDTwoRowGEMV : public Primitive {
+ public:
+  explicit ExpertSSDTwoRowGEMV(Stream stream) : Primitive(stream) {}
+
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+    throw std::runtime_error(
+        "[ExpertSSDTwoRowGEMV] CPU evaluation not supported");
+  }
+
+  void eval_gpu(
+      const std::vector<array>& inputs,
+      std::vector<array>& outputs) override {
+    if (inputs.size() != 2 || outputs.size() != 1) {
+      throw std::runtime_error(
+          "[ExpertSSDTwoRowGEMV] invalid input/output arity");
+    }
+    for (const auto& input : inputs) {
+      if (!input.flags().row_contiguous) {
+        throw std::runtime_error(
+            "[ExpertSSDTwoRowGEMV] inputs must be row-contiguous");
+      }
+    }
+
+    const auto& x = inputs[0];
+    const auto& weight = inputs[1];
+    auto& output = outputs[0];
+    output.set_data(allocator::malloc(output.nbytes()));
+
+    const int K = x.shape(-1);
+    const int N = weight.shape(0);
+    constexpr int bm = 1;
+    constexpr int bn = 8;
+    constexpr int sm = 1;
+    constexpr int sn = 32;
+    constexpr int tm = 4;
+    constexpr int tn = 4;
+    constexpr bool noncontiguous_batch = false;
+    constexpr bool axpby = false;
+
+    auto& d = metal::device(stream().device);
+    auto* kernel = get_gemv_kernel(
+        d,
+        x.dtype() == bfloat16
+            ? "gemv_bfloat16_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0"
+            : "gemv_float32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0",
+        output,
+        false,
+        bm,
+        bn,
+        sm,
+        sn,
+        tm,
+        tn,
+        noncontiguous_batch,
+        axpby);
+    auto& encoder = metal::get_command_encoder(stream());
+    encoder.set_compute_pipeline_state(kernel);
+    encoder.set_input_array(weight, 0);
+    encoder.set_input_array(x, 1);
+    encoder.set_output_array(output, 3);
+    encoder.set_bytes(K, 4);
+    encoder.set_bytes(N, 5);
+    encoder.set_bytes(K, 6);
+
+    const int batch_ndim = 1;
+    const Shape batch_shape{2};
+    const Strides vector_batch_stride{K};
+    const Strides matrix_batch_stride{0};
+    encoder.set_bytes(batch_ndim, 9);
+    encoder.set_vector_bytes(batch_shape, 10);
+    encoder.set_vector_bytes(vector_batch_stride, 11);
+    encoder.set_vector_bytes(matrix_batch_stride, 12);
+
+    const int outputs_per_group = bm * sm * tm;
+    const int groups = (N + outputs_per_group - 1) / outputs_per_group;
+    encoder.dispatch_threadgroups(
+        MTL::Size(groups, 1, 2), MTL::Size(32, bn, bm));
+  }
+
+  DEFINE_NAME(ExpertSSDTwoRowGEMV)
 };
 
 class ExpertSSDMXFP4MaskedQMV : public Primitive {
@@ -629,6 +813,100 @@ std::vector<array> expert_ssd_mxfp4_pair_qmv(
       {bfloat16, bfloat16},
       primitive,
       {x, up_weight, up_scales, gate_weight, gate_scales, routes});
+}
+
+array expert_ssd_mxfp4_two_row_qmv(
+    const array& x,
+    const array& weight,
+    const array& scales,
+    StreamOrDevice s) {
+  if ((x.dtype() != bfloat16 && x.dtype() != float32) ||
+      weight.dtype() != uint32 ||
+      scales.dtype() != uint8) {
+    throw std::invalid_argument(
+        "[expert_ssd_mxfp4_two_row_qmv] requires BF16/FP32 input and MXFP4 weights");
+  }
+  if (x.ndim() < 2 || x.shape(-2) != 2 || x.size() != 2 * x.shape(-1) ||
+      weight.ndim() != 2 || scales.ndim() != 2 ||
+      weight.shape(0) != scales.shape(0)) {
+    throw std::invalid_argument(
+        "[expert_ssd_mxfp4_two_row_qmv] invalid two-row geometry");
+  }
+  const int K = x.shape(-1);
+  const int N = weight.shape(-2);
+  if (K % 512 != 0 || N % 8 != 0 || weight.shape(-1) * 8 != K ||
+      scales.shape(-1) * 32 != K) {
+    throw std::invalid_argument(
+        "[expert_ssd_mxfp4_two_row_qmv] geometry is not MXFP4 QMV compatible");
+  }
+  Shape output_shape = x.shape();
+  output_shape.back() = N;
+  auto primitive =
+      std::make_shared<ExpertSSDMXFP4TwoRowQMV>(to_stream(s, Device::gpu));
+  return array::make_arrays(
+      {output_shape}, {x.dtype()}, primitive, {x, weight, scales})[0];
+}
+
+array expert_ssd_mxfp4_grouped_two_row_qmv(
+    const array& x,
+    const array& weight,
+    const array& scales,
+    StreamOrDevice s) {
+  if ((x.dtype() != bfloat16 && x.dtype() != float32) ||
+      weight.dtype() != uint32 ||
+      scales.dtype() != uint8) {
+    throw std::invalid_argument(
+        "[expert_ssd_mxfp4_grouped_two_row_qmv] requires BF16/FP32 input and MXFP4 weights");
+  }
+  if (x.ndim() != 3 || x.shape(-2) != 2 || weight.ndim() != 3 ||
+      scales.ndim() != 3 || x.shape(0) != weight.shape(0) ||
+      weight.shape(0) != scales.shape(0) ||
+      weight.shape(1) != scales.shape(1)) {
+    throw std::invalid_argument(
+        "[expert_ssd_mxfp4_grouped_two_row_qmv] invalid grouped geometry");
+  }
+  const int K = x.shape(-1);
+  const int N = weight.shape(-2);
+  if (K % 512 != 0 || N % 8 != 0 || weight.shape(-1) * 8 != K ||
+      scales.shape(-1) * 32 != K) {
+    throw std::invalid_argument(
+        "[expert_ssd_mxfp4_grouped_two_row_qmv] geometry is not MXFP4 QMV compatible");
+  }
+  Shape output_shape = x.shape();
+  output_shape.back() = N;
+  auto primitive = std::make_shared<ExpertSSDMXFP4GroupedTwoRowQMV>(
+      to_stream(s, Device::gpu));
+  return array::make_arrays(
+      {output_shape}, {x.dtype()}, primitive, {x, weight, scales})[0];
+}
+
+array expert_ssd_two_row_gemv(
+    const array& x,
+    const array& weight,
+    StreamOrDevice s) {
+  if ((x.dtype() != bfloat16 && x.dtype() != float32) ||
+      weight.dtype() != x.dtype()) {
+    throw std::invalid_argument(
+        "[expert_ssd_two_row_gemv] requires matching BF16/FP32 inputs");
+  }
+  if (x.ndim() < 2 || x.shape(-2) != 2 ||
+      x.size() != 2 * x.shape(-1) || weight.ndim() != 2 ||
+      weight.shape(1) != x.shape(-1)) {
+    throw std::invalid_argument(
+        "[expert_ssd_two_row_gemv] invalid two-row geometry");
+  }
+  const int K = x.shape(-1);
+  const int N = weight.shape(0);
+  if (K < 16 * N || N < 4 || N % 4 != 0) {
+    throw std::invalid_argument(
+        "[expert_ssd_two_row_gemv] geometry does not select the canonical width-one GEMV specialization");
+  }
+  Shape output_shape = x.shape();
+  output_shape.back() = N;
+  auto primitive =
+      std::make_shared<ExpertSSDTwoRowGEMV>(to_stream(s, Device::gpu));
+  return array::make_arrays(
+      {output_shape}, {x.dtype()}, primitive, {x, weight})[0];
 }
 
 array expert_ssd_mxfp4_masked_qmv(
