@@ -76,10 +76,29 @@ MLX_API array expert_ssd_mxfp4_grouped_two_row_qmv(
     const array& scales,
     StreamOrDevice s = {});
 
+// Exact three-row companions. Every verifier position retains the canonical
+// width-one reduction order while sharing one Metal dispatch.
+MLX_API array expert_ssd_mxfp4_three_row_qmv(
+    const array& x,
+    const array& weight,
+    const array& scales,
+    StreamOrDevice s = {});
+
+MLX_API array expert_ssd_mxfp4_grouped_three_row_qmv(
+    const array& x,
+    const array& weight,
+    const array& scales,
+    StreamOrDevice s = {});
+
 // Apply one row-major matrix to exactly two BF16 or FP32 vectors using the
 // same GEMV specialization and reduction order selected by width-one matmul.
 // The vectors share one Metal dispatch but remain independent GEMV batches.
 MLX_API array expert_ssd_two_row_gemv(
+    const array& x,
+    const array& weight,
+    StreamOrDevice s = {});
+
+MLX_API array expert_ssd_three_row_gemv(
     const array& x,
     const array& weight,
     StreamOrDevice s = {});
@@ -119,6 +138,17 @@ MLX_API array expert_ssd_scalex_mxfp4_qmv_split_routes(
 // Fixed width-two/top-six ScaleX Down QMV with exact BF16 route-score
 // reduction and shared-expert addition in the same Metal dispatch.
 MLX_API array expert_ssd_scalex_mxfp4_width2_down_reduce(
+    const array& x,
+    const array& weight,
+    const array& scale_records,
+    const array& weight_routes,
+    const array& scale_routes,
+    const array& scores,
+    const array& shared,
+    StreamOrDevice s = {});
+
+// Fixed width-three/top-six peer of the width-two kernel above.
+MLX_API array expert_ssd_scalex_mxfp4_width3_down_reduce(
     const array& x,
     const array& weight,
     const array& scale_records,

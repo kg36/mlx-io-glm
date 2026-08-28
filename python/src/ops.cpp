@@ -1355,6 +1355,31 @@ void init_ops(nb::module_& m) {
       nb::sig(
           "def _expert_ssd_mxfp4_grouped_two_row_qmv(x: array, weight: array, scales: array) -> array"));
   m.def(
+      "_expert_ssd_mxfp4_three_row_qmv",
+      [](const mx::array& x,
+         const mx::array& weight,
+         const mx::array& scales) {
+        return mx::expert_ssd_mxfp4_three_row_qmv(x, weight, scales);
+      },
+      "x"_a,
+      "weight"_a,
+      "scales"_a,
+      nb::sig(
+          "def _expert_ssd_mxfp4_three_row_qmv(x: array, weight: array, scales: array) -> array"));
+  m.def(
+      "_expert_ssd_mxfp4_grouped_three_row_qmv",
+      [](const mx::array& x,
+         const mx::array& weight,
+         const mx::array& scales) {
+        return mx::expert_ssd_mxfp4_grouped_three_row_qmv(
+            x, weight, scales);
+      },
+      "x"_a,
+      "weight"_a,
+      "scales"_a,
+      nb::sig(
+          "def _expert_ssd_mxfp4_grouped_three_row_qmv(x: array, weight: array, scales: array) -> array"));
+  m.def(
       "_expert_ssd_two_row_gemv",
       [](const mx::array& x, const mx::array& weight) {
         return mx::expert_ssd_two_row_gemv(x, weight);
@@ -1363,6 +1388,15 @@ void init_ops(nb::module_& m) {
       "weight"_a,
       nb::sig(
           "def _expert_ssd_two_row_gemv(x: array, weight: array) -> array"));
+  m.def(
+      "_expert_ssd_three_row_gemv",
+      [](const mx::array& x, const mx::array& weight) {
+        return mx::expert_ssd_three_row_gemv(x, weight);
+      },
+      "x"_a,
+      "weight"_a,
+      nb::sig(
+          "def _expert_ssd_three_row_gemv(x: array, weight: array) -> array"));
   m.def(
       "_expert_ssd_mxfp4_masked_qmv",
       [](const mx::array& x,
@@ -1444,6 +1478,33 @@ void init_ops(nb::module_& m) {
       "shared"_a,
       nb::sig(
           "def _expert_ssd_scalex_mxfp4_width2_down_reduce(x: array, weight: array, scale_records: array, weight_routes: array, scale_routes: array, scores: array, shared: array) -> array"));
+  m.def(
+      "_expert_ssd_scalex_mxfp4_width3_down_reduce",
+      [](const mx::array& x,
+         const mx::array& weight,
+         const mx::array& scale_records,
+         const mx::array& weight_routes,
+         const mx::array& scale_routes,
+         const mx::array& scores,
+         const mx::array& shared) {
+        return mx::expert_ssd_scalex_mxfp4_width3_down_reduce(
+            x,
+            weight,
+            scale_records,
+            weight_routes,
+            scale_routes,
+            scores,
+            shared);
+      },
+      "x"_a,
+      "weight"_a,
+      "scale_records"_a,
+      "weight_routes"_a,
+      "scale_routes"_a,
+      "scores"_a,
+      "shared"_a,
+      nb::sig(
+          "def _expert_ssd_scalex_mxfp4_width3_down_reduce(x: array, weight: array, scale_records: array, weight_routes: array, scale_routes: array, scores: array, shared: array) -> array"));
   m.def(
       "_expert_ssd_scalex_conditional_m0",
       [](const mx::array& indices,
