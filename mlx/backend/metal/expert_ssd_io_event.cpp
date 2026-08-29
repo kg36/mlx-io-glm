@@ -1052,6 +1052,182 @@ class ExpertSSDScaleXConditionalM0 : public Primitive {
   float swiglu_limit_;
 };
 
+class ExpertSSDScaleXConditionalM0TwoBank : public Primitive {
+ public:
+  ExpertSSDScaleXConditionalM0TwoBank(
+      Stream stream,
+      int width,
+      float swiglu_limit)
+      : Primitive(stream), width_(width), swiglu_limit_(swiglu_limit) {}
+
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+    throw std::runtime_error(
+        "[ExpertSSDScaleXConditionalM0TwoBank] CPU evaluation not supported");
+  }
+
+  void eval_gpu(
+      const std::vector<array>& inputs,
+      std::vector<array>& outputs) override {
+    if (inputs.size() != 24 || outputs.size() != 1) {
+      throw std::runtime_error(
+          "[ExpertSSDScaleXConditionalM0TwoBank] invalid input/output arity");
+    }
+    outputs[0].set_data(allocator::malloc(outputs[0].nbytes()));
+
+    constexpr int hidden = 4096;
+    constexpr int intermediate = 2048;
+    constexpr uint32_t top_k = 6;
+    const uint32_t route_count = static_cast<uint32_t>(width_ * top_k);
+    const uint32_t expert_count = static_cast<uint32_t>(inputs[12].size());
+    const int private_record_stride = inputs[4].shape(-1);
+    const int shared_record_stride = inputs[8].shape(-1);
+    const size_t bf16_bytes = 2;
+    const size_t route_bytes = sizeof(uint32_t);
+    auto& d = metal::device(stream().device);
+    auto& command_encoder = metal::get_command_encoder(stream());
+    for (const auto& input : inputs) {
+      command_encoder.register_input_array(input);
+    }
+    command_encoder.register_output_array(outputs[0]);
+    for (size_t index = 15; index < inputs.size(); ++index) {
+      command_encoder.register_output_array(inputs[index]);
+    }
+    auto* encoder = command_encoder.expert_ssd_raw_compute_encoder();
+
+    encoder->setComputePipelineState(
+        d.get_kernel("dsv4_scalex_m0_map_two_bank_indirect"));
+    encoder->setBuffer(expert_ssd_buffer(inputs[0]), expert_ssd_offset(inputs[0]), 0);
+    encoder->setBuffer(expert_ssd_buffer(inputs[12]), expert_ssd_offset(inputs[12]), 1);
+    encoder->setBuffer(expert_ssd_buffer(inputs[13]), expert_ssd_offset(inputs[13]), 2);
+    encoder->setBuffer(expert_ssd_buffer(inputs[14]), expert_ssd_offset(inputs[14]), 3);
+    encoder->setBuffer(expert_ssd_buffer(inputs[15]), expert_ssd_offset(inputs[15]), 4);
+    encoder->setBuffer(expert_ssd_buffer(inputs[16]), expert_ssd_offset(inputs[16]), 5);
+    encoder->setBuffer(expert_ssd_buffer(inputs[17]), expert_ssd_offset(inputs[17]), 6);
+    encoder->setBuffer(expert_ssd_buffer(inputs[18]), expert_ssd_offset(inputs[18]), 7);
+    encoder->setBuffer(expert_ssd_buffer(inputs[23]), expert_ssd_offset(inputs[23]), 8);
+    encoder->setBytes(&route_count, sizeof(route_count), 9);
+    encoder->setBytes(&expert_count, sizeof(expert_count), 10);
+    const uint32_t width_u32 = static_cast<uint32_t>(width_);
+    encoder->setBytes(&width_u32, sizeof(width_u32), 11);
+    encoder->dispatchThreads(
+        MTL::Size(route_count, 1, 1), MTL::Size(32, 1, 1));
+    encoder->memoryBarrier(MTL::BarrierScopeBuffers);
+
+    auto* pair_kernel =
+        d.get_kernel("dsv4_scalex_m0_pair_qmv_sparse_two_bank_bf16");
+    for (int position = 0; position < width_; ++position) {
+      const size_t route_offset = position * top_k * route_bytes;
+      const size_t x_offset = position * hidden * bf16_bytes;
+      const size_t intermediate_offset =
+          position * top_k * intermediate * bf16_bytes;
+      encoder->setComputePipelineState(pair_kernel);
+      encoder->setBuffer(expert_ssd_buffer(inputs[7]), expert_ssd_offset(inputs[7]), 0);
+      encoder->setBuffer(expert_ssd_buffer(inputs[5]), expert_ssd_offset(inputs[5]), 1);
+      encoder->setBuffer(expert_ssd_buffer(inputs[4]), expert_ssd_offset(inputs[4]), 2);
+      encoder->setBuffer(expert_ssd_buffer(inputs[11]), expert_ssd_offset(inputs[11]), 3);
+      encoder->setBuffer(expert_ssd_buffer(inputs[9]), expert_ssd_offset(inputs[9]), 4);
+      encoder->setBuffer(expert_ssd_buffer(inputs[8]), expert_ssd_offset(inputs[8]), 5);
+      encoder->setBuffer(expert_ssd_buffer(inputs[1]), expert_ssd_offset(inputs[1], x_offset), 6);
+      encoder->setBuffer(expert_ssd_buffer(inputs[15]), expert_ssd_offset(inputs[15], route_offset), 7);
+      encoder->setBuffer(expert_ssd_buffer(inputs[17]), expert_ssd_offset(inputs[17], route_offset), 8);
+      encoder->setBuffer(expert_ssd_buffer(inputs[19]), expert_ssd_offset(inputs[19], intermediate_offset), 9);
+      encoder->setBuffer(expert_ssd_buffer(inputs[20]), expert_ssd_offset(inputs[20], intermediate_offset), 10);
+      encoder->setBytes(&hidden, sizeof(hidden), 11);
+      encoder->setBytes(&intermediate, sizeof(intermediate), 12);
+      encoder->setBytes(&private_record_stride, sizeof(private_record_stride), 13);
+      encoder->setBytes(&shared_record_stride, sizeof(shared_record_stride), 14);
+      encoder->setBytes(&top_k, sizeof(top_k), 15);
+      encoder->dispatchThreadgroups(
+          expert_ssd_buffer(inputs[23]),
+          expert_ssd_offset(inputs[23], position * 3 * sizeof(uint32_t)),
+          MTL::Size(32, 2, 1));
+    }
+    encoder->memoryBarrier(MTL::BarrierScopeBuffers);
+
+    const uint32_t activated_count = route_count * intermediate;
+    encoder->setComputePipelineState(
+        d.get_kernel("dsv4_scalex_m0_limited_swiglu_bf16"));
+    encoder->setBuffer(expert_ssd_buffer(inputs[19]), expert_ssd_offset(inputs[19]), 0);
+    encoder->setBuffer(expert_ssd_buffer(inputs[20]), expert_ssd_offset(inputs[20]), 1);
+    encoder->setBuffer(expert_ssd_buffer(inputs[15]), expert_ssd_offset(inputs[15]), 2);
+    encoder->setBuffer(expert_ssd_buffer(inputs[21]), expert_ssd_offset(inputs[21]), 3);
+    const uint32_t intermediate_u32 = static_cast<uint32_t>(intermediate);
+    encoder->setBytes(&intermediate_u32, sizeof(intermediate_u32), 4);
+    encoder->setBytes(&activated_count, sizeof(activated_count), 5);
+    encoder->setBytes(&swiglu_limit_, sizeof(swiglu_limit_), 6);
+    encoder->dispatchThreadgroups(
+        expert_ssd_buffer(inputs[23]),
+        expert_ssd_offset(inputs[23], width_ * 3 * sizeof(uint32_t)),
+        MTL::Size(256, 1, 1));
+    encoder->memoryBarrier(MTL::BarrierScopeBuffers);
+
+    if (width_ == 2) {
+      encoder->setComputePipelineState(
+          d.get_kernel("dsv4_scalex_mxfp4_width2_down_reduce_two_bank_bf16"));
+      encoder->setBuffer(expert_ssd_buffer(inputs[6]), expert_ssd_offset(inputs[6]), 0);
+      encoder->setBuffer(expert_ssd_buffer(inputs[4]), expert_ssd_offset(inputs[4]), 1);
+      encoder->setBuffer(expert_ssd_buffer(inputs[10]), expert_ssd_offset(inputs[10]), 2);
+      encoder->setBuffer(expert_ssd_buffer(inputs[8]), expert_ssd_offset(inputs[8]), 3);
+      encoder->setBuffer(expert_ssd_buffer(inputs[21]), expert_ssd_offset(inputs[21]), 4);
+      encoder->setBuffer(expert_ssd_buffer(inputs[16]), expert_ssd_offset(inputs[16]), 5);
+      encoder->setBuffer(expert_ssd_buffer(inputs[15]), expert_ssd_offset(inputs[15]), 6);
+      encoder->setBuffer(expert_ssd_buffer(inputs[17]), expert_ssd_offset(inputs[17]), 7);
+      encoder->setBuffer(expert_ssd_buffer(inputs[2]), expert_ssd_offset(inputs[2]), 8);
+      encoder->setBuffer(expert_ssd_buffer(inputs[3]), expert_ssd_offset(inputs[3]), 9);
+      encoder->setBuffer(expert_ssd_buffer(outputs[0]), expert_ssd_offset(outputs[0]), 10);
+      encoder->setBytes(&intermediate, sizeof(intermediate), 11);
+      encoder->setBytes(&hidden, sizeof(hidden), 12);
+      encoder->setBytes(&private_record_stride, sizeof(private_record_stride), 13);
+      encoder->setBytes(&shared_record_stride, sizeof(shared_record_stride), 14);
+    } else {
+      encoder->setComputePipelineState(
+          d.get_kernel("dsv4_scalex_mxfp4_qmv_split_two_bank_bf16"));
+      encoder->setBuffer(expert_ssd_buffer(inputs[6]), expert_ssd_offset(inputs[6]), 0);
+      encoder->setBuffer(expert_ssd_buffer(inputs[4]), expert_ssd_offset(inputs[4]), 1);
+      encoder->setBuffer(expert_ssd_buffer(inputs[10]), expert_ssd_offset(inputs[10]), 2);
+      encoder->setBuffer(expert_ssd_buffer(inputs[8]), expert_ssd_offset(inputs[8]), 3);
+      encoder->setBuffer(expert_ssd_buffer(inputs[21]), expert_ssd_offset(inputs[21]), 4);
+      encoder->setBuffer(expert_ssd_buffer(inputs[16]), expert_ssd_offset(inputs[16]), 5);
+      encoder->setBuffer(expert_ssd_buffer(inputs[15]), expert_ssd_offset(inputs[15]), 6);
+      encoder->setBuffer(expert_ssd_buffer(inputs[17]), expert_ssd_offset(inputs[17]), 7);
+      encoder->setBuffer(expert_ssd_buffer(inputs[22]), expert_ssd_offset(inputs[22]), 8);
+      encoder->setBytes(&intermediate, sizeof(intermediate), 9);
+      encoder->setBytes(&hidden, sizeof(hidden), 10);
+      encoder->setBytes(&private_record_stride, sizeof(private_record_stride), 11);
+      encoder->setBytes(&shared_record_stride, sizeof(shared_record_stride), 12);
+      const uint32_t split_projection = 1;
+      encoder->setBytes(&split_projection, sizeof(split_projection), 13);
+    }
+    encoder->dispatchThreadgroups(
+        expert_ssd_buffer(inputs[23]),
+        expert_ssd_offset(inputs[23], (width_ + 1) * 3 * sizeof(uint32_t)),
+        MTL::Size(32, 2, 1));
+    encoder->memoryBarrier(MTL::BarrierScopeBuffers);
+
+    if (width_ == 1) {
+      encoder->setComputePipelineState(
+          d.get_kernel("dsv4_scalex_m0_score_reduce_shared_bf16"));
+      encoder->setBuffer(expert_ssd_buffer(inputs[22]), expert_ssd_offset(inputs[22]), 0);
+      encoder->setBuffer(expert_ssd_buffer(inputs[2]), expert_ssd_offset(inputs[2]), 1);
+      encoder->setBuffer(expert_ssd_buffer(inputs[3]), expert_ssd_offset(inputs[3]), 2);
+      encoder->setBuffer(expert_ssd_buffer(outputs[0]), expert_ssd_offset(outputs[0]), 3);
+      const uint32_t hidden_u32 = static_cast<uint32_t>(hidden);
+      encoder->setBytes(&hidden_u32, sizeof(hidden_u32), 4);
+      encoder->setBytes(&top_k, sizeof(top_k), 5);
+      encoder->dispatchThreadgroups(
+          expert_ssd_buffer(inputs[23]),
+          expert_ssd_offset(inputs[23], (width_ + 2) * 3 * sizeof(uint32_t)),
+          MTL::Size(256, 1, 1));
+    }
+  }
+
+  DEFINE_NAME(ExpertSSDScaleXConditionalM0TwoBank)
+
+ private:
+  int width_;
+  float swiglu_limit_;
+};
+
 } // namespace
 
 std::shared_ptr<ExpertSSDIoEventState> expert_ssd_io_event_state_new() {
@@ -1906,6 +2082,125 @@ array expert_ssd_scalex_conditional_m0(
        down_directory,
        gate_routes_scratch,
        down_routes_scratch,
+       all_hit_scratch,
+       up_scratch,
+       gate_scratch,
+       activated_scratch,
+       routed_scratch,
+       indirect_scratch});
+}
+
+array expert_ssd_scalex_conditional_m0_two_bank(
+    const array& indices,
+    const array& x,
+    const array& scores,
+    const array& shared,
+    const array& private_scale_records,
+    const array& private_gate_weight,
+    const array& private_down_weight,
+    const array& private_up_weight,
+    const array& shared_scale_records,
+    const array& shared_gate_weight,
+    const array& shared_down_weight,
+    const array& shared_up_weight,
+    const array& gate_directory,
+    const array& down_directory,
+    const array& bank_directory,
+    const array& gate_routes_scratch,
+    const array& down_routes_scratch,
+    const array& bank_routes_scratch,
+    const array& all_hit_scratch,
+    const array& up_scratch,
+    const array& gate_scratch,
+    const array& activated_scratch,
+    const array& routed_scratch,
+    const array& indirect_scratch,
+    float swiglu_limit,
+    StreamOrDevice s) {
+  const int width = x.ndim() == 3 ? x.shape(1) : 0;
+  const auto private_rows = private_gate_weight.shape(0);
+  const auto shared_rows = shared_gate_weight.shape(0);
+  if ((width != 1 && width != 2) || x.dtype() != bfloat16 ||
+      x.shape(0) != 1 || x.shape(2) != 4096 || indices.dtype() != int32 ||
+      indices.shape() != Shape{1, width, 6} || scores.dtype() != float32 ||
+      scores.shape() != Shape{1, width, 6} || shared.dtype() != bfloat16 ||
+      shared.shape() != x.shape() ||
+      private_scale_records.dtype() != uint8 ||
+      shared_scale_records.dtype() != uint8 ||
+      private_scale_records.ndim() != 2 || shared_scale_records.ndim() != 2 ||
+      private_gate_weight.dtype() != uint32 ||
+      private_down_weight.dtype() != uint32 ||
+      private_up_weight.dtype() != uint32 ||
+      shared_gate_weight.dtype() != uint32 ||
+      shared_down_weight.dtype() != uint32 ||
+      shared_up_weight.dtype() != uint32 ||
+      private_gate_weight.shape() != private_up_weight.shape() ||
+      shared_gate_weight.shape() != shared_up_weight.shape() ||
+      private_gate_weight.ndim() != 3 || shared_gate_weight.ndim() != 3 ||
+      private_gate_weight.shape(1) != 2048 ||
+      private_gate_weight.shape(2) != 512 ||
+      shared_gate_weight.shape(1) != 2048 ||
+      shared_gate_weight.shape(2) != 512 ||
+      private_down_weight.ndim() != 3 || shared_down_weight.ndim() != 3 ||
+      private_down_weight.shape(0) != private_rows ||
+      shared_down_weight.shape(0) != shared_rows ||
+      private_down_weight.shape(1) != 4096 ||
+      private_down_weight.shape(2) != 256 ||
+      shared_down_weight.shape(1) != 4096 ||
+      shared_down_weight.shape(2) != 256 ||
+      private_scale_records.shape(0) != private_rows ||
+      shared_scale_records.shape(0) != shared_rows ||
+      gate_directory.dtype() != int32 || down_directory.dtype() != int32 ||
+      bank_directory.dtype() != int32 || gate_directory.ndim() != 1 ||
+      down_directory.ndim() != 1 || bank_directory.ndim() != 1 ||
+      gate_directory.shape() != down_directory.shape() ||
+      gate_directory.shape() != bank_directory.shape() ||
+      gate_routes_scratch.dtype() != uint32 ||
+      gate_routes_scratch.shape() != Shape{12} ||
+      down_routes_scratch.dtype() != uint32 ||
+      down_routes_scratch.shape() != Shape{12} ||
+      bank_routes_scratch.dtype() != uint32 ||
+      bank_routes_scratch.shape() != Shape{12} ||
+      all_hit_scratch.dtype() != int32 ||
+      all_hit_scratch.shape() != Shape{1} ||
+      up_scratch.dtype() != bfloat16 ||
+      up_scratch.shape() != Shape{12, 1, 2048} ||
+      gate_scratch.dtype() != bfloat16 ||
+      gate_scratch.shape() != Shape{12, 1, 2048} ||
+      activated_scratch.dtype() != bfloat16 ||
+      activated_scratch.shape() != Shape{12, 1, 2048} ||
+      routed_scratch.dtype() != bfloat16 ||
+      routed_scratch.shape() != Shape{12, 1, 4096} ||
+      indirect_scratch.dtype() != uint32 ||
+      indirect_scratch.shape() != Shape{5, 3} ||
+      !(swiglu_limit > 0.0f)) {
+    throw std::invalid_argument(
+        "[expert_ssd_scalex_conditional_m0_two_bank] incompatible inputs");
+  }
+  auto primitive = std::make_shared<ExpertSSDScaleXConditionalM0TwoBank>(
+      to_stream(s, Device::gpu), width, swiglu_limit);
+  return array(
+      x.shape(),
+      bfloat16,
+      primitive,
+      {indices,
+       x,
+       scores,
+       shared,
+       private_scale_records,
+       private_gate_weight,
+       private_down_weight,
+       private_up_weight,
+       shared_scale_records,
+       shared_gate_weight,
+       shared_down_weight,
+       shared_up_weight,
+       gate_directory,
+       down_directory,
+       bank_directory,
+       gate_routes_scratch,
+       down_routes_scratch,
+       bank_routes_scratch,
        all_hit_scratch,
        up_scratch,
        gate_scratch,

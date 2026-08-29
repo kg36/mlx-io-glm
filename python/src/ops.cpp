@@ -901,6 +901,65 @@ class ExpertSSDGlobalPoolState {
     return output;
   }
 
+  void replay_all_hit_route(
+      int64_t layer,
+      const std::vector<int64_t>& routed) {
+    if (routed.empty()) {
+      throw std::invalid_argument(
+          "ExpertSSD global-pool all-hit route cannot be empty");
+    }
+    auto& state = layer_state(layer);
+    const auto layer_index = layer_lookup_.at(layer);
+    std::vector<int64_t> unique;
+    std::vector<int32_t> counts;
+    unique.reserve(routed.size());
+    counts.reserve(routed.size());
+    std::unordered_map<int64_t, int32_t> compact_ids;
+    compact_ids.reserve(std::min<size_t>(routed.size(), expert_count_));
+    for (const auto expert : routed) {
+      validate_expert(expert);
+      auto [iterator, inserted] = compact_ids.emplace(
+          expert, static_cast<int32_t>(unique.size()));
+      if (inserted) {
+        unique.push_back(expert);
+        counts.push_back(0);
+      }
+      counts[iterator->second] += 1;
+    }
+    if (unique.size() > state.capacity + shared_capacity_) {
+      throw std::invalid_argument(
+          "ExpertSSD global-pool all-hit route exceeds cache capacity");
+    }
+    for (const auto expert : unique) {
+      const auto private_row = state.expert_to_row[expert];
+      const auto shared_row = shared_rows_[key(layer_index, expert)];
+      if ((private_row >= 0) == (shared_row >= 0)) {
+        throw std::invalid_argument(
+            "ExpertSSD global-pool deferred route is no longer all-hit");
+      }
+    }
+
+    // Reproduce the policy-only portion of plan() exactly. Unlike the
+    // per-layer cache, the shared pool is globally authoritative, so this
+    // touch is applied immediately rather than deferred across another
+    // layer's possible victim decision.
+    ++state.call_index;
+    decay_retention(state);
+    std::vector<int64_t> all_experts(expert_count_);
+    std::iota(all_experts.begin(), all_experts.end(), 0);
+    const auto markov_scores = state.markov->update_and_score(
+        unique, all_experts);
+    record_route_intervals(state, unique);
+    record_lhd_accesses(state, unique, counts);
+    refresh_layer_retention(layer_index, state, markov_scores);
+    for (const auto expert : unique) {
+      touch(layer_index, expert);
+    }
+    state.miss_pressure =
+        (1.0 - miss_pressure_alpha_) * state.miss_pressure;
+    hits_ += unique.size();
+  }
+
   void restore_rows(
       const std::vector<std::vector<int64_t>>& private_assignments,
       const std::vector<std::vector<int64_t>>& shared_assignments) {
@@ -2183,6 +2242,23 @@ void init_ops(nb::module_& m) {
       nb::sig(
           "def _expert_ssd_global_pool_plan(state: _ExpertSSDGlobalPoolState, layer: int, indices: array) -> dict"));
   m.def(
+      "_expert_ssd_global_pool_replay_all_hit",
+      [](std::shared_ptr<ExpertSSDGlobalPoolState> state,
+         int64_t layer,
+         const std::vector<int64_t>& routed) {
+        if (!state) {
+          throw std::invalid_argument(
+              "ExpertSSD global-pool state is required");
+        }
+        nb::gil_scoped_release release;
+        state->replay_all_hit_route(layer, routed);
+      },
+      "state"_a,
+      "layer"_a,
+      "routed"_a,
+      nb::sig(
+          "def _expert_ssd_global_pool_replay_all_hit(state: _ExpertSSDGlobalPoolState, layer: int, routed: list[int]) -> None"));
+  m.def(
       "_expert_ssd_global_pool_restore_rows",
       [](std::shared_ptr<ExpertSSDGlobalPoolState> state,
          const std::vector<std::vector<int64_t>>& private_assignments,
@@ -2679,6 +2755,71 @@ void init_ops(nb::module_& m) {
       "swiglu_limit"_a = 10.0f,
       nb::sig(
           "def _expert_ssd_scalex_conditional_m0(indices: array, x: array, scores: array, shared: array, scale_records: array, gate_weight: array, down_weight: array, up_weight: array, gate_directory: array, down_directory: array, gate_routes_scratch: array, down_routes_scratch: array, all_hit_scratch: array, up_scratch: array, gate_scratch: array, activated_scratch: array, routed_scratch: array, indirect_scratch: array, swiglu_limit: float = 10.0) -> array"));
+  m.def(
+      "_expert_ssd_scalex_conditional_m0_two_bank",
+      [](const mx::array& indices,
+         const mx::array& x,
+         const mx::array& scores,
+         const mx::array& shared,
+         const mx::array& private_scale_records,
+         const mx::array& private_gate_weight,
+         const mx::array& private_down_weight,
+         const mx::array& private_up_weight,
+         const mx::array& shared_scale_records,
+         const mx::array& shared_gate_weight,
+         const mx::array& shared_down_weight,
+         const mx::array& shared_up_weight,
+         const mx::array& gate_directory,
+         const mx::array& down_directory,
+         const mx::array& bank_directory,
+         const mx::array& gate_routes_scratch,
+         const mx::array& down_routes_scratch,
+         const mx::array& bank_routes_scratch,
+         const mx::array& all_hit_scratch,
+         const mx::array& up_scratch,
+         const mx::array& gate_scratch,
+         const mx::array& activated_scratch,
+         const mx::array& routed_scratch,
+         const mx::array& indirect_scratch,
+         float swiglu_limit) {
+        return mx::expert_ssd_scalex_conditional_m0_two_bank(
+            indices, x, scores, shared,
+            private_scale_records, private_gate_weight,
+            private_down_weight, private_up_weight,
+            shared_scale_records, shared_gate_weight,
+            shared_down_weight, shared_up_weight,
+            gate_directory, down_directory, bank_directory,
+            gate_routes_scratch, down_routes_scratch, bank_routes_scratch,
+            all_hit_scratch, up_scratch, gate_scratch, activated_scratch,
+            routed_scratch, indirect_scratch, swiglu_limit);
+      },
+      "indices"_a,
+      "x"_a,
+      "scores"_a,
+      "shared"_a,
+      "private_scale_records"_a,
+      "private_gate_weight"_a,
+      "private_down_weight"_a,
+      "private_up_weight"_a,
+      "shared_scale_records"_a,
+      "shared_gate_weight"_a,
+      "shared_down_weight"_a,
+      "shared_up_weight"_a,
+      "gate_directory"_a,
+      "down_directory"_a,
+      "bank_directory"_a,
+      "gate_routes_scratch"_a,
+      "down_routes_scratch"_a,
+      "bank_routes_scratch"_a,
+      "all_hit_scratch"_a,
+      "up_scratch"_a,
+      "gate_scratch"_a,
+      "activated_scratch"_a,
+      "routed_scratch"_a,
+      "indirect_scratch"_a,
+      "swiglu_limit"_a = 10.0f,
+      nb::sig(
+          "def _expert_ssd_scalex_conditional_m0_two_bank(indices: array, x: array, scores: array, shared: array, private_scale_records: array, private_gate_weight: array, private_down_weight: array, private_up_weight: array, shared_scale_records: array, shared_gate_weight: array, shared_down_weight: array, shared_up_weight: array, gate_directory: array, down_directory: array, bank_directory: array, gate_routes_scratch: array, down_routes_scratch: array, bank_routes_scratch: array, all_hit_scratch: array, up_scratch: array, gate_scratch: array, activated_scratch: array, routed_scratch: array, indirect_scratch: array, swiglu_limit: float = 10.0) -> array"));
   m.def(
       "_expert_ssd_route_plan",
       &official_direct_route_plan,

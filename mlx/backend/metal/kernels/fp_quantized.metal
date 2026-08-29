@@ -1071,6 +1071,65 @@ METAL_FUNC void dsv4_scalex_mxfp4_fixed_down_reduce_bf16_impl(
   }
 }
 
+// Two-bank variant of the optimistic M0 selector. Row directories remain
+// separate from the bank directory so a shared row can use the same compact
+// physical index as a private row without ambiguity.
+[[kernel]] void dsv4_scalex_m0_map_two_bank_indirect(
+    const device int32_t* expert_ids [[buffer(0)]],
+    const device int32_t* gate_directory [[buffer(1)]],
+    const device int32_t* down_directory [[buffer(2)]],
+    const device int32_t* bank_directory [[buffer(3)]],
+    device uint32_t* gate_routes [[buffer(4)]],
+    device uint32_t* down_routes [[buffer(5)]],
+    device uint32_t* bank_routes [[buffer(6)]],
+    device int32_t* all_hit_status [[buffer(7)]],
+    device uint* indirect_threadgroups [[buffer(8)]],
+    const constant uint& route_count [[buffer(9)]],
+    const constant uint& expert_count [[buffer(10)]],
+    const constant uint& width [[buffer(11)]],
+    uint index [[thread_position_in_grid]]) {
+  if (index < route_count) {
+    const int32_t expert = expert_ids[index];
+    const bool valid = expert >= 0 && uint(expert) < expert_count;
+    const int32_t gate_slot = valid ? gate_directory[expert] : -1;
+    const int32_t down_slot = valid ? down_directory[expert] : -1;
+    const int32_t bank = valid ? bank_directory[expert] : -1;
+    gate_routes[index] = gate_slot >= 0 ? uint(gate_slot) : 0xffffffffu;
+    down_routes[index] = down_slot >= 0 ? uint(down_slot) : 0xffffffffu;
+    bank_routes[index] = bank >= 0 ? uint(bank) : 0xffffffffu;
+  }
+  if (index == 0u) {
+    bool all_hit = true;
+    for (uint route = 0u; route < route_count; ++route) {
+      const int32_t expert = expert_ids[route];
+      const bool valid = expert >= 0 && uint(expert) < expert_count;
+      all_hit = all_hit && valid && gate_directory[expert] >= 0 &&
+          down_directory[expert] >= 0 && bank_directory[expert] >= 0;
+    }
+    all_hit_status[0] = all_hit ? 1 : 0;
+    const uint enabled = all_hit ? 1u : 0u;
+    for (uint position = 0u; position < width; ++position) {
+      const uint base = position * 3u;
+      indirect_threadgroups[base] = enabled;
+      indirect_threadgroups[base + 1u] = 256u;
+      indirect_threadgroups[base + 2u] = 6u;
+    }
+    uint base = width * 3u;
+    indirect_threadgroups[base] =
+        enabled * ((route_count * 2048u + 255u) / 256u);
+    indirect_threadgroups[base + 1u] = 1u;
+    indirect_threadgroups[base + 2u] = 1u;
+    base += 3u;
+    indirect_threadgroups[base] = enabled;
+    indirect_threadgroups[base + 1u] = 512u;
+    indirect_threadgroups[base + 2u] = width == 2u ? 2u : route_count;
+    base += 3u;
+    indirect_threadgroups[base] = width == 1u ? enabled * 16u : 0u;
+    indirect_threadgroups[base + 1u] = 1u;
+    indirect_threadgroups[base + 2u] = 1u;
+  }
+}
+
 [[kernel]] void dsv4_scalex_m0_pair_qmv_sparse_bf16(
     const device uint32_t* up_weight [[buffer(0)]],
     const device uint32_t* gate_weight [[buffer(1)]],
@@ -1091,6 +1150,58 @@ METAL_FUNC void dsv4_scalex_mxfp4_fixed_down_reduce_bf16_impl(
   if (route_position >= route_count) return;
   const uint slot = routes[route_position];
   if (slot == 0xffffffffu) return;
+  const ulong weight_stride =
+      ulong(out_vec_size) * ulong(in_vec_size / 8);
+  const uint scale_count = uint(out_vec_size * (in_vec_size / 32));
+  const device uint8_t* record =
+      scale_records + ulong(slot) * ulong(record_stride);
+  const uint3 qmv_tid(0u, tid.y, 0u);
+  dsv4_scalex_qmv_fast_impl<bfloat16_t, 32, 4>(
+      up_weight + ulong(slot) * weight_stride, record,
+      scale_tile + simd_gid * 512u, 2u * scale_count, x,
+      up_output + ulong(route_position) * ulong(out_vec_size),
+      in_vec_size, out_vec_size, qmv_tid, simd_gid, simd_lid);
+  dsv4_scalex_qmv_fast_impl<bfloat16_t, 32, 4>(
+      gate_weight + ulong(slot) * weight_stride, record,
+      scale_tile + simd_gid * 512u, 0u, x,
+      gate_output + ulong(route_position) * ulong(out_vec_size),
+      in_vec_size, out_vec_size, qmv_tid, simd_gid, simd_lid);
+}
+
+[[kernel]] void dsv4_scalex_m0_pair_qmv_sparse_two_bank_bf16(
+    const device uint32_t* private_up_weight [[buffer(0)]],
+    const device uint32_t* private_gate_weight [[buffer(1)]],
+    const device uint8_t* private_scale_records [[buffer(2)]],
+    const device uint32_t* shared_up_weight [[buffer(3)]],
+    const device uint32_t* shared_gate_weight [[buffer(4)]],
+    const device uint8_t* shared_scale_records [[buffer(5)]],
+    const device bfloat16_t* x [[buffer(6)]],
+    const device uint32_t* routes [[buffer(7)]],
+    const device uint32_t* bank_routes [[buffer(8)]],
+    device bfloat16_t* up_output [[buffer(9)]],
+    device bfloat16_t* gate_output [[buffer(10)]],
+    const constant int& in_vec_size [[buffer(11)]],
+    const constant int& out_vec_size [[buffer(12)]],
+    const constant int& private_record_stride [[buffer(13)]],
+    const constant int& shared_record_stride [[buffer(14)]],
+    const constant uint& route_count [[buffer(15)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  threadgroup uint8_t scale_tile[1024];
+  const uint route_position = tid.z;
+  if (route_position >= route_count) return;
+  const uint slot = routes[route_position];
+  if (slot == 0xffffffffu) return;
+  const bool use_shared = bank_routes[route_position] != 0u;
+  const device uint32_t* up_weight =
+      use_shared ? shared_up_weight : private_up_weight;
+  const device uint32_t* gate_weight =
+      use_shared ? shared_gate_weight : private_gate_weight;
+  const device uint8_t* scale_records =
+      use_shared ? shared_scale_records : private_scale_records;
+  const int record_stride =
+      use_shared ? shared_record_stride : private_record_stride;
   const ulong weight_stride =
       ulong(out_vec_size) * ulong(in_vec_size / 8);
   const uint scale_count = uint(out_vec_size * (in_vec_size / 32));

@@ -235,4 +235,32 @@ MLX_API array expert_ssd_scalex_conditional_m0(
     float swiglu_limit = 10.0f,
     StreamOrDevice s = {});
 
+MLX_API array expert_ssd_scalex_conditional_m0_two_bank(
+    const array& indices,
+    const array& x,
+    const array& scores,
+    const array& shared,
+    const array& private_scale_records,
+    const array& private_gate_weight,
+    const array& private_down_weight,
+    const array& private_up_weight,
+    const array& shared_scale_records,
+    const array& shared_gate_weight,
+    const array& shared_down_weight,
+    const array& shared_up_weight,
+    const array& gate_directory,
+    const array& down_directory,
+    const array& bank_directory,
+    const array& gate_routes_scratch,
+    const array& down_routes_scratch,
+    const array& bank_routes_scratch,
+    const array& all_hit_scratch,
+    const array& up_scratch,
+    const array& gate_scratch,
+    const array& activated_scratch,
+    const array& routed_scratch,
+    const array& indirect_scratch,
+    float swiglu_limit = 10.0f,
+    StreamOrDevice s = {});
+
 } // namespace mlx::core
