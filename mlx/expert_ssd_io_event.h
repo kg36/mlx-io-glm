@@ -123,6 +123,20 @@ MLX_API array expert_ssd_scalex_mxfp4_qmv(
     uint32_t projection,
     StreamOrDevice s = {});
 
+// Bank-transparent peer of the fixed ScaleX QMV. Each route selects either
+// the layer-private bank or the model-wide shared bank without splitting the
+// MLX graph. bank_routes contains zero for private and one for shared.
+MLX_API array expert_ssd_scalex_mxfp4_qmv_two_bank(
+    const array& x,
+    const array& private_weight,
+    const array& private_scale_records,
+    const array& shared_weight,
+    const array& shared_scale_records,
+    const array& routes,
+    const array& bank_routes,
+    uint32_t projection,
+    StreamOrDevice s = {});
+
 // Coupled projection-cache variant. Down weights and their shared ScaleX
 // records may use different physical row ids while retaining one resident
 // expert set.
@@ -132,6 +146,18 @@ MLX_API array expert_ssd_scalex_mxfp4_qmv_split_routes(
     const array& scale_records,
     const array& weight_routes,
     const array& scale_routes,
+    uint32_t projection,
+    StreamOrDevice s = {});
+
+MLX_API array expert_ssd_scalex_mxfp4_qmv_split_routes_two_bank(
+    const array& x,
+    const array& private_weight,
+    const array& private_scale_records,
+    const array& shared_weight,
+    const array& shared_scale_records,
+    const array& weight_routes,
+    const array& scale_routes,
+    const array& bank_routes,
     uint32_t projection,
     StreamOrDevice s = {});
 
@@ -147,6 +173,19 @@ MLX_API array expert_ssd_scalex_mxfp4_width2_down_reduce(
     const array& shared,
     StreamOrDevice s = {});
 
+MLX_API array expert_ssd_scalex_mxfp4_width2_down_reduce_two_bank(
+    const array& x,
+    const array& private_weight,
+    const array& private_scale_records,
+    const array& shared_weight,
+    const array& shared_scale_records,
+    const array& weight_routes,
+    const array& scale_routes,
+    const array& bank_routes,
+    const array& scores,
+    const array& shared,
+    StreamOrDevice s = {});
+
 // Fixed width-three/top-six peer of the width-two kernel above.
 MLX_API array expert_ssd_scalex_mxfp4_width3_down_reduce(
     const array& x,
@@ -154,6 +193,19 @@ MLX_API array expert_ssd_scalex_mxfp4_width3_down_reduce(
     const array& scale_records,
     const array& weight_routes,
     const array& scale_routes,
+    const array& scores,
+    const array& shared,
+    StreamOrDevice s = {});
+
+MLX_API array expert_ssd_scalex_mxfp4_width3_down_reduce_two_bank(
+    const array& x,
+    const array& private_weight,
+    const array& private_scale_records,
+    const array& shared_weight,
+    const array& shared_scale_records,
+    const array& weight_routes,
+    const array& scale_routes,
+    const array& bank_routes,
     const array& scores,
     const array& shared,
     StreamOrDevice s = {});

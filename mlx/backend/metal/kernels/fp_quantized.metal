@@ -541,6 +541,70 @@ METAL_FUNC void dsv4_scalex_qmv_fast_impl(
       simd_lid);
 }
 
+// One logical QMV over two physical slot banks. Bank selection is uniform for
+// every threadgroup because tid.z names one routed expert, so this preserves
+// the single-bank dispatch topology without route partitioning.
+[[kernel]] void dsv4_scalex_mxfp4_qmv_two_bank_bf16(
+    const device uint32_t* private_weight [[buffer(0)]],
+    const device uint8_t* private_scale_records [[buffer(1)]],
+    const device uint32_t* shared_weight [[buffer(2)]],
+    const device uint8_t* shared_scale_records [[buffer(3)]],
+    const device bfloat16_t* x [[buffer(4)]],
+    const device uint32_t* routes [[buffer(5)]],
+    const device uint32_t* bank_routes [[buffer(6)]],
+    device bfloat16_t* output [[buffer(7)]],
+    const constant int& in_vec_size [[buffer(8)]],
+    const constant int& out_vec_size [[buffer(9)]],
+    const constant int& private_record_stride [[buffer(10)]],
+    const constant int& shared_record_stride [[buffer(11)]],
+    const constant uint& projection [[buffer(12)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  threadgroup uint8_t scale_tile[1024];
+  const uint route_position = tid.z;
+  const uint slot = routes[route_position];
+  if (slot == 0xffffffffu) {
+    if (simd_lid < 4u) {
+      const uint row = tid.y * 8u + simd_gid * 4u + simd_lid;
+      if (row < uint(out_vec_size)) {
+        output[ulong(route_position) * ulong(out_vec_size) + row] =
+            bfloat16_t(0.0f);
+      }
+    }
+    return;
+  }
+  const bool use_shared = bank_routes[route_position] != 0u;
+  const device uint32_t* weight =
+      use_shared ? shared_weight : private_weight;
+  const device uint8_t* scale_records =
+      use_shared ? shared_scale_records : private_scale_records;
+  const int record_stride =
+      use_shared ? shared_record_stride : private_record_stride;
+  const ulong weight_stride =
+      ulong(out_vec_size) * ulong(in_vec_size / 8);
+  const uint scale_count = uint(out_vec_size * (in_vec_size / 32));
+  const device uint8_t* record =
+      scale_records + ulong(slot) * ulong(record_stride);
+  const device bfloat16_t* route_x =
+      projection == 1u
+      ? x + ulong(route_position) * ulong(in_vec_size)
+      : x;
+  const uint3 qmv_tid(0u, tid.y, 0u);
+  dsv4_scalex_qmv_fast_impl<bfloat16_t, 32, 4>(
+      weight + ulong(slot) * weight_stride,
+      record,
+      scale_tile + simd_gid * 512u,
+      projection * scale_count,
+      route_x,
+      output + ulong(route_position) * ulong(out_vec_size),
+      in_vec_size,
+      out_vec_size,
+      qmv_tid,
+      simd_gid,
+      simd_lid);
+}
+
 [[kernel]] void dsv4_scalex_mxfp4_qmv_split_bf16(
     const device uint32_t* weight [[buffer(0)]],
     const device uint8_t* scale_records [[buffer(1)]],
@@ -583,22 +647,80 @@ METAL_FUNC void dsv4_scalex_qmv_fast_impl(
       simd_lid);
 }
 
+[[kernel]] void dsv4_scalex_mxfp4_qmv_split_two_bank_bf16(
+    const device uint32_t* private_weight [[buffer(0)]],
+    const device uint8_t* private_scale_records [[buffer(1)]],
+    const device uint32_t* shared_weight [[buffer(2)]],
+    const device uint8_t* shared_scale_records [[buffer(3)]],
+    const device bfloat16_t* x [[buffer(4)]],
+    const device uint32_t* weight_routes [[buffer(5)]],
+    const device uint32_t* scale_routes [[buffer(6)]],
+    const device uint32_t* bank_routes [[buffer(7)]],
+    device bfloat16_t* output [[buffer(8)]],
+    const constant int& in_vec_size [[buffer(9)]],
+    const constant int& out_vec_size [[buffer(10)]],
+    const constant int& private_record_stride [[buffer(11)]],
+    const constant int& shared_record_stride [[buffer(12)]],
+    const constant uint& projection [[buffer(13)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  threadgroup uint8_t scale_tile[1024];
+  const uint route_position = tid.z;
+  const uint weight_slot = weight_routes[route_position];
+  const uint scale_slot = scale_routes[route_position];
+  const bool use_shared = bank_routes[route_position] != 0u;
+  const device uint32_t* weight =
+      use_shared ? shared_weight : private_weight;
+  const device uint8_t* scale_records =
+      use_shared ? shared_scale_records : private_scale_records;
+  const int record_stride =
+      use_shared ? shared_record_stride : private_record_stride;
+  const ulong weight_stride =
+      ulong(out_vec_size) * ulong(in_vec_size / 8);
+  const uint scale_count = uint(out_vec_size * (in_vec_size / 32));
+  const device uint8_t* record =
+      scale_records + ulong(scale_slot) * ulong(record_stride);
+  const device bfloat16_t* route_x =
+      projection == 1u
+      ? x + ulong(route_position) * ulong(in_vec_size)
+      : x;
+  const uint3 qmv_tid(0u, tid.y, 0u);
+  dsv4_scalex_qmv_fast_impl<bfloat16_t, 32, 4>(
+      weight + ulong(weight_slot) * weight_stride,
+      record,
+      scale_tile + simd_gid * 512u,
+      projection * scale_count,
+      route_x,
+      output + ulong(route_position) * ulong(out_vec_size),
+      in_vec_size,
+      out_vec_size,
+      qmv_tid,
+      simd_gid,
+      simd_lid);
+}
+
 // Fixed-width/top-six Down projection with the exact BF16 score-reduction
 // order and shared-expert add folded into the same dispatch. Width two and
 // width three have separate Metal entry points but deliberately share this
 // arithmetic body so both preserve canonical width-one route accumulation.
 METAL_FUNC void dsv4_scalex_mxfp4_fixed_down_reduce_bf16_impl(
-    const device uint32_t* weight,
-    const device uint8_t* scale_records,
+    const device uint32_t* private_weight,
+    const device uint8_t* private_scale_records,
+    const device uint32_t* shared_weight,
+    const device uint8_t* shared_scale_records,
     const device bfloat16_t* x,
     const device uint32_t* weight_routes,
     const device uint32_t* scale_routes,
+    const device uint32_t* bank_routes,
     const device float* scores,
     const device bfloat16_t* shared,
     device bfloat16_t* output,
     const constant int& in_vec_size,
     const constant int& out_vec_size,
-    const constant int& record_stride,
+    const constant int& private_record_stride,
+    const constant int& shared_record_stride,
+    const bool two_bank,
     threadgroup uint8_t* scale_tile,
     uint3 tid,
     uint simd_gid,
@@ -625,6 +747,14 @@ METAL_FUNC void dsv4_scalex_mxfp4_fixed_down_reduce_bf16_impl(
     const uint route_position = token * topk + expert;
     const uint weight_slot = weight_routes[route_position];
     const uint scale_slot = scale_routes[route_position];
+    const bool use_shared =
+        two_bank && bank_routes[route_position] != 0u;
+    const device uint32_t* weight =
+        use_shared ? shared_weight : private_weight;
+    const device uint8_t* scale_records =
+        use_shared ? shared_scale_records : private_scale_records;
+    const int record_stride =
+        use_shared ? shared_record_stride : private_record_stride;
     const device uint8_t* record =
         scale_records + ulong(scale_slot) * ulong(record_stride);
     const uint codec = uint(record[4]);
@@ -741,15 +871,20 @@ METAL_FUNC void dsv4_scalex_mxfp4_fixed_down_reduce_bf16_impl(
   dsv4_scalex_mxfp4_fixed_down_reduce_bf16_impl(
       weight,
       scale_records,
+      weight,
+      scale_records,
       x,
       weight_routes,
       scale_routes,
+      weight_routes,
       scores,
       shared,
       output,
       in_vec_size,
       out_vec_size,
       record_stride,
+      record_stride,
+      false,
       scale_tile,
       tid,
       simd_gid,
@@ -775,15 +910,106 @@ METAL_FUNC void dsv4_scalex_mxfp4_fixed_down_reduce_bf16_impl(
   dsv4_scalex_mxfp4_fixed_down_reduce_bf16_impl(
       weight,
       scale_records,
+      weight,
+      scale_records,
       x,
       weight_routes,
       scale_routes,
+      weight_routes,
       scores,
       shared,
       output,
       in_vec_size,
       out_vec_size,
       record_stride,
+      record_stride,
+      false,
+      scale_tile,
+      tid,
+      simd_gid,
+      simd_lid);
+}
+
+[[kernel]] void dsv4_scalex_mxfp4_width2_down_reduce_two_bank_bf16(
+    const device uint32_t* private_weight [[buffer(0)]],
+    const device uint8_t* private_scale_records [[buffer(1)]],
+    const device uint32_t* shared_weight [[buffer(2)]],
+    const device uint8_t* shared_scale_records [[buffer(3)]],
+    const device bfloat16_t* x [[buffer(4)]],
+    const device uint32_t* weight_routes [[buffer(5)]],
+    const device uint32_t* scale_routes [[buffer(6)]],
+    const device uint32_t* bank_routes [[buffer(7)]],
+    const device float* scores [[buffer(8)]],
+    const device bfloat16_t* shared [[buffer(9)]],
+    device bfloat16_t* output [[buffer(10)]],
+    const constant int& in_vec_size [[buffer(11)]],
+    const constant int& out_vec_size [[buffer(12)]],
+    const constant int& private_record_stride [[buffer(13)]],
+    const constant int& shared_record_stride [[buffer(14)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  threadgroup uint8_t scale_tile[1024];
+  dsv4_scalex_mxfp4_fixed_down_reduce_bf16_impl(
+      private_weight,
+      private_scale_records,
+      shared_weight,
+      shared_scale_records,
+      x,
+      weight_routes,
+      scale_routes,
+      bank_routes,
+      scores,
+      shared,
+      output,
+      in_vec_size,
+      out_vec_size,
+      private_record_stride,
+      shared_record_stride,
+      true,
+      scale_tile,
+      tid,
+      simd_gid,
+      simd_lid);
+}
+
+[[kernel]] void dsv4_scalex_mxfp4_width3_down_reduce_two_bank_bf16(
+    const device uint32_t* private_weight [[buffer(0)]],
+    const device uint8_t* private_scale_records [[buffer(1)]],
+    const device uint32_t* shared_weight [[buffer(2)]],
+    const device uint8_t* shared_scale_records [[buffer(3)]],
+    const device bfloat16_t* x [[buffer(4)]],
+    const device uint32_t* weight_routes [[buffer(5)]],
+    const device uint32_t* scale_routes [[buffer(6)]],
+    const device uint32_t* bank_routes [[buffer(7)]],
+    const device float* scores [[buffer(8)]],
+    const device bfloat16_t* shared [[buffer(9)]],
+    device bfloat16_t* output [[buffer(10)]],
+    const constant int& in_vec_size [[buffer(11)]],
+    const constant int& out_vec_size [[buffer(12)]],
+    const constant int& private_record_stride [[buffer(13)]],
+    const constant int& shared_record_stride [[buffer(14)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  threadgroup uint8_t scale_tile[1024];
+  dsv4_scalex_mxfp4_fixed_down_reduce_bf16_impl(
+      private_weight,
+      private_scale_records,
+      shared_weight,
+      shared_scale_records,
+      x,
+      weight_routes,
+      scale_routes,
+      bank_routes,
+      scores,
+      shared,
+      output,
+      in_vec_size,
+      out_vec_size,
+      private_record_stride,
+      shared_record_stride,
+      true,
       scale_tile,
       tid,
       simd_gid,

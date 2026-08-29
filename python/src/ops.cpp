@@ -14,6 +14,7 @@
 #include <ostream>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 #include <variant>
 
 #include <sys/mman.h>
@@ -691,6 +692,706 @@ class ExpertSSDRouteCacheState {
   size_t evictions_{0};
 };
 
+struct ExpertSSDGlobalPoolPlan {
+  std::vector<int64_t> routed;
+  std::vector<int64_t> unique;
+  std::vector<int32_t> counts;
+  std::vector<int32_t> compact;
+  std::vector<uint8_t> shared_bank;
+  std::vector<int32_t> rows;
+  std::vector<uint8_t> resident_before;
+  std::vector<int64_t> missing;
+  std::vector<uint8_t> missing_shared_bank;
+  std::vector<int32_t> missing_rows;
+  std::vector<int64_t> evicted_layers;
+  std::vector<int64_t> evicted_experts;
+  size_t hits{0};
+  size_t misses{0};
+};
+
+class ExpertSSDGlobalPoolState {
+ public:
+  ExpertSSDGlobalPoolState(
+      size_t expert_count,
+      const std::vector<int64_t>& layers,
+      const std::vector<int64_t>& private_capacities,
+      size_t shared_capacity,
+      double retention_decay,
+      double interval_alpha,
+      double initial_interval,
+      double age_weight,
+      double deadline_weight,
+      double markov_boost,
+      size_t markov_history,
+      double miss_pressure_alpha,
+      double miss_pressure_weight)
+      : expert_count_(expert_count),
+        shared_capacity_(shared_capacity),
+        retention_decay_(retention_decay),
+        interval_alpha_(interval_alpha),
+        initial_interval_(initial_interval),
+        age_weight_(age_weight),
+        deadline_weight_(deadline_weight),
+        markov_boost_(markov_boost),
+        miss_pressure_alpha_(miss_pressure_alpha),
+        miss_pressure_weight_(miss_pressure_weight) {
+    if (expert_count_ == 0 || layers.empty() ||
+        layers.size() != private_capacities.size() || shared_capacity_ == 0 ||
+        markov_history == 0) {
+      throw std::invalid_argument(
+          "ExpertSSD global-pool dimensions are invalid");
+    }
+    if (retention_decay_ < 0.0 || retention_decay_ > 1.0 ||
+        interval_alpha_ <= 0.0 || interval_alpha_ > 1.0 ||
+        initial_interval_ <= 0.0 || age_weight_ < 0.0 ||
+        deadline_weight_ < 0.0 || markov_boost_ < 0.0 ||
+        miss_pressure_alpha_ < 0.0 ||
+        miss_pressure_alpha_ > 1.0 || miss_pressure_weight_ < 0.0) {
+      throw std::invalid_argument(
+          "ExpertSSD global-pool policy parameters are invalid");
+    }
+    std::unordered_set<int64_t> unique_layers;
+    for (size_t index = 0; index < layers.size(); ++index) {
+      const auto layer = layers[index];
+      const auto capacity = private_capacities[index];
+      if (layer < 0 || !unique_layers.insert(layer).second || capacity <= 0 ||
+          static_cast<size_t>(capacity) > expert_count_) {
+        throw std::invalid_argument(
+            "ExpertSSD global-pool layer contract is invalid");
+      }
+      layer_lookup_[layer] = index;
+      LayerState state;
+      state.layer = layer;
+      state.capacity = static_cast<size_t>(capacity);
+      state.expert_to_row.assign(expert_count_, -1);
+      state.demand.assign(expert_count_, 0.0);
+      state.last_seen.assign(expert_count_, -1);
+      state.interval_ema.assign(expert_count_, initial_interval_);
+      state.route_last_seen.assign(expert_count_, -1);
+      state.route_interval_ema.assign(expert_count_, initial_interval_);
+      state.markov = std::make_shared<ExpertSSDMarkovState>(
+          expert_count_, markov_history);
+      for (size_t row = state.capacity; row > 0; --row) {
+        state.free_rows.push_back(static_cast<int32_t>(row - 1));
+      }
+      layers_.push_back(std::move(state));
+    }
+    const auto key_count = layers_.size() * expert_count_;
+    shared_rows_.assign(key_count, -1);
+    retention_.assign(key_count, 0.0);
+    last_access_.assign(key_count, 0);
+    for (size_t row = shared_capacity_; row > 0; --row) {
+      shared_free_rows_.push_back(static_cast<int32_t>(row - 1));
+    }
+  }
+
+  ExpertSSDGlobalPoolPlan plan(int64_t layer, const mx::array& indices) {
+    auto& state = layer_state(layer);
+    ExpertSSDGlobalPoolPlan output;
+    flatten(indices, output.routed);
+    output.compact.reserve(output.routed.size());
+    std::unordered_map<int64_t, int32_t> compact_ids;
+    compact_ids.reserve(std::min<size_t>(output.routed.size(), expert_count_));
+    for (const auto expert : output.routed) {
+      validate_expert(expert);
+      auto [iterator, inserted] = compact_ids.emplace(
+          expert, static_cast<int32_t>(output.unique.size()));
+      if (inserted) {
+        output.unique.push_back(expert);
+        output.counts.push_back(0);
+      }
+      output.compact.push_back(iterator->second);
+      output.counts[iterator->second] += 1;
+    }
+    if (output.unique.size() > state.capacity + shared_capacity_) {
+      throw std::invalid_argument(
+          "ExpertSSD route exceeds two-tier cache capacity");
+    }
+
+    const auto layer_index = layer_lookup_.at(layer);
+    std::vector<uint8_t> protected_experts(expert_count_, 0);
+    for (const auto expert : output.unique) {
+      protected_experts[expert] = 1;
+      output.resident_before.push_back(
+          state.expert_to_row[expert] >= 0 ||
+          shared_rows_[key(layer_index, expert)] >= 0);
+    }
+
+    ++state.call_index;
+    decay_retention(state);
+    std::vector<int64_t> all_experts(expert_count_);
+    std::iota(all_experts.begin(), all_experts.end(), 0);
+    const auto markov_scores = state.markov->update_and_score(
+        output.unique, all_experts);
+    record_route_intervals(state, output.unique);
+    record_lhd_accesses(state, output.unique, output.counts);
+    refresh_layer_retention(layer_index, state, markov_scores);
+
+    for (size_t index = 0; index < output.unique.size(); ++index) {
+      const auto expert = output.unique[index];
+      auto private_row = state.expert_to_row[expert];
+      auto shared_row = shared_rows_[key(layer_index, expert)];
+      if (private_row >= 0 || shared_row >= 0) {
+        ++output.hits;
+        touch(layer_index, expert);
+        continue;
+      }
+      ++output.misses;
+      bool use_shared = false;
+      int32_t row = -1;
+      if (!state.free_rows.empty()) {
+        row = state.free_rows.back();
+        state.free_rows.pop_back();
+      } else if (!shared_free_rows_.empty()) {
+        use_shared = true;
+        row = shared_free_rows_.back();
+        shared_free_rows_.pop_back();
+      } else {
+        const auto private_victim = choose_private_victim(
+            layer_index, state, protected_experts);
+        const auto shared_victim = choose_shared_victim(
+            layer_index, protected_experts);
+        if (!private_victim.valid && !shared_victim.valid) {
+          throw std::invalid_argument(
+              "ExpertSSD global pool has no safe victim");
+        }
+        const auto victim = worse(private_victim, shared_victim)
+            ? private_victim
+            : shared_victim;
+        use_shared = victim.shared;
+        row = remove(victim);
+        output.evicted_layers.push_back(layers_[victim.layer_index].layer);
+        output.evicted_experts.push_back(victim.expert);
+        if (victim.shared) {
+          ++shared_evictions_;
+        } else {
+          ++private_evictions_;
+        }
+        ++evictions_;
+      }
+      if (use_shared) {
+        shared_rows_[key(layer_index, expert)] = row;
+      } else {
+        state.expert_to_row[expert] = row;
+      }
+      retention_[key(layer_index, expert)] = score(
+          state, expert, markov_scores[expert]);
+      touch(layer_index, expert);
+      output.missing.push_back(expert);
+      output.missing_shared_bank.push_back(use_shared);
+      output.missing_rows.push_back(row);
+    }
+
+    for (const auto expert : output.unique) {
+      const auto private_row = state.expert_to_row[expert];
+      const auto shared_row = shared_rows_[key(layer_index, expert)];
+      if ((private_row >= 0) == (shared_row >= 0)) {
+        throw std::invalid_argument(
+            "ExpertSSD global-pool bank maps diverged");
+      }
+      output.shared_bank.push_back(shared_row >= 0);
+      output.rows.push_back(shared_row >= 0 ? shared_row : private_row);
+    }
+    const auto miss_ratio = static_cast<double>(output.misses) /
+        static_cast<double>(std::max<size_t>(1, output.unique.size()));
+    state.miss_pressure = miss_pressure_alpha_ * miss_ratio +
+        (1.0 - miss_pressure_alpha_) * state.miss_pressure;
+    hits_ += output.hits;
+    misses_ += output.misses;
+    return output;
+  }
+
+  void restore_rows(
+      const std::vector<std::vector<int64_t>>& private_assignments,
+      const std::vector<std::vector<int64_t>>& shared_assignments) {
+    if (hits_ != 0 || misses_ != 0 || evictions_ != 0) {
+      throw std::invalid_argument(
+          "ExpertSSD global-pool restore requires unused state");
+    }
+    for (const auto& state : layers_) {
+      if (std::any_of(
+              state.expert_to_row.begin(),
+              state.expert_to_row.end(),
+              [](int32_t row) { return row >= 0; })) {
+        throw std::invalid_argument(
+            "ExpertSSD global-pool restore requires empty private rows");
+      }
+    }
+    if (std::any_of(
+            shared_rows_.begin(),
+            shared_rows_.end(),
+            [](int32_t row) { return row >= 0; })) {
+      throw std::invalid_argument(
+          "ExpertSSD global-pool restore requires empty shared rows");
+    }
+
+    std::vector<std::vector<uint8_t>> private_rows_used;
+    private_rows_used.reserve(layers_.size());
+    for (const auto& state : layers_) {
+      private_rows_used.emplace_back(state.capacity, 0);
+    }
+    std::vector<uint8_t> shared_rows_used(shared_capacity_, 0);
+    std::vector<uint8_t> resident_keys(layers_.size() * expert_count_, 0);
+
+    const auto validate_assignment = [&]
+        (const std::vector<int64_t>& assignment, bool shared)
+        -> std::tuple<size_t, int64_t, int32_t> {
+      if (assignment.size() != 3) {
+        throw std::invalid_argument(
+            "ExpertSSD global-pool assignment must be [layer, expert, row]");
+      }
+      const auto layer_iterator = layer_lookup_.find(assignment[0]);
+      if (layer_iterator == layer_lookup_.end()) {
+        throw std::invalid_argument(
+            "ExpertSSD global-pool restore layer is unmanaged");
+      }
+      const auto layer_index = layer_iterator->second;
+      const auto expert = assignment[1];
+      validate_expert(expert);
+      const auto row = assignment[2];
+      const auto capacity = shared
+          ? shared_capacity_
+          : layers_[layer_index].capacity;
+      if (row < 0 || static_cast<size_t>(row) >= capacity) {
+        throw std::invalid_argument(
+            "ExpertSSD global-pool restore row is invalid");
+      }
+      const auto resident_key = key(layer_index, expert);
+      if (resident_keys[resident_key]) {
+        throw std::invalid_argument(
+            "ExpertSSD global-pool restore duplicates an expert");
+      }
+      resident_keys[resident_key] = 1;
+      auto& rows_used = shared
+          ? shared_rows_used
+          : private_rows_used[layer_index];
+      if (rows_used[row]) {
+        throw std::invalid_argument(
+            "ExpertSSD global-pool restore duplicates a row");
+      }
+      rows_used[row] = 1;
+      return {layer_index, expert, static_cast<int32_t>(row)};
+    };
+
+    std::vector<std::tuple<size_t, int64_t, int32_t>> private_parsed;
+    std::vector<std::tuple<size_t, int64_t, int32_t>> shared_parsed;
+    private_parsed.reserve(private_assignments.size());
+    shared_parsed.reserve(shared_assignments.size());
+    for (const auto& assignment : private_assignments) {
+      private_parsed.push_back(validate_assignment(assignment, false));
+    }
+    for (const auto& assignment : shared_assignments) {
+      shared_parsed.push_back(validate_assignment(assignment, true));
+    }
+
+    for (const auto& [layer_index, expert, row] : private_parsed) {
+      layers_[layer_index].expert_to_row[expert] = row;
+    }
+    for (const auto& [layer_index, expert, row] : shared_parsed) {
+      shared_rows_[key(layer_index, expert)] = row;
+    }
+    for (size_t layer_index = 0; layer_index < layers_.size(); ++layer_index) {
+      auto& state = layers_[layer_index];
+      state.free_rows.clear();
+      for (size_t row = state.capacity; row > 0; --row) {
+        if (!private_rows_used[layer_index][row - 1]) {
+          state.free_rows.push_back(static_cast<int32_t>(row - 1));
+        }
+      }
+    }
+    shared_free_rows_.clear();
+    for (size_t row = shared_capacity_; row > 0; --row) {
+      if (!shared_rows_used[row - 1]) {
+        shared_free_rows_.push_back(static_cast<int32_t>(row - 1));
+      }
+    }
+  }
+
+  void restore_layer_policy(
+      int64_t layer,
+      int64_t clock,
+      double demand_scale,
+      const std::vector<double>& demand,
+      const std::vector<int64_t>& last_seen,
+      const std::vector<double>& interval_ema,
+      const std::string& markov_payload) {
+    if (hits_ != 0 || misses_ != 0 || evictions_ != 0 || clock < 0 ||
+        !std::isfinite(demand_scale) || demand_scale <= 0.0 ||
+        demand.size() != expert_count_ || last_seen.size() != expert_count_ ||
+        interval_ema.size() != expert_count_) {
+      throw std::invalid_argument(
+          "ExpertSSD global-pool restored policy is invalid");
+    }
+    if (std::any_of(demand.begin(), demand.end(), [](double value) {
+          return !std::isfinite(value) || value < 0.0;
+        }) ||
+        std::any_of(interval_ema.begin(), interval_ema.end(), [](double value) {
+          return !std::isfinite(value) || value <= 0.0;
+        }) ||
+        std::any_of(last_seen.begin(), last_seen.end(), [clock](int64_t value) {
+          return value < -1 || value > clock;
+        })) {
+      throw std::invalid_argument(
+          "ExpertSSD global-pool restored policy vectors are invalid");
+    }
+    auto& state = layer_state(layer);
+    const auto layer_index = layer_lookup_.at(layer);
+    state.clock = clock;
+    state.demand_scale = demand_scale;
+    state.demand = demand;
+    state.last_seen = last_seen;
+    state.interval_ema = interval_ema;
+    if (!markov_payload.empty()) {
+      state.markov->restore(markov_payload);
+    }
+    for (size_t expert = 0; expert < expert_count_; ++expert) {
+      const auto resident_key = key(layer_index, static_cast<int64_t>(expert));
+      if (state.expert_to_row[expert] >= 0 || shared_rows_[resident_key] >= 0) {
+        retention_[resident_key] = score(
+            state, static_cast<int64_t>(expert), 0.0);
+        const auto seen = state.last_seen[expert];
+        last_access_[resident_key] =
+            seen < 0 ? uint64_t{0} : static_cast<uint64_t>(seen);
+        serial_ = std::max(serial_, last_access_[resident_key]);
+      }
+    }
+  }
+
+  nb::dict metadata() const {
+    nb::dict output;
+    nb::list layer_entries;
+    for (size_t layer_index = 0; layer_index < layers_.size(); ++layer_index) {
+      const auto& state = layers_[layer_index];
+      nb::dict entry;
+      entry["layer"] = state.layer;
+      nb::list private_rows;
+      nb::list shared_rows;
+      for (size_t expert = 0; expert < expert_count_; ++expert) {
+        if (state.expert_to_row[expert] >= 0) {
+          private_rows.append(nb::make_tuple(
+              static_cast<int64_t>(expert), state.expert_to_row[expert]));
+        }
+        const auto shared_row = shared_rows_[key(layer_index, expert)];
+        if (shared_row >= 0) {
+          shared_rows.append(nb::make_tuple(
+              static_cast<int64_t>(expert), shared_row));
+        }
+      }
+      entry["private_rows"] = private_rows;
+      entry["shared_rows"] = shared_rows;
+      entry["clock"] = state.clock;
+      entry["demand_scale"] = state.demand_scale;
+      entry["demand"] = state.demand;
+      entry["last_seen"] = state.last_seen;
+      entry["interval_ema"] = state.interval_ema;
+      entry["miss_pressure"] = state.miss_pressure;
+      layer_entries.append(entry);
+    }
+    output["layers"] = layer_entries;
+    output["shared_capacity"] = shared_capacity_;
+    output["hits"] = hits_;
+    output["misses"] = misses_;
+    output["evictions"] = evictions_;
+    output["private_evictions"] = private_evictions_;
+    output["shared_evictions"] = shared_evictions_;
+    return output;
+  }
+
+ private:
+  struct LayerState {
+    int64_t layer{-1};
+    size_t capacity{0};
+    std::vector<int32_t> expert_to_row;
+    std::vector<int32_t> free_rows;
+    std::shared_ptr<ExpertSSDMarkovState> markov;
+    int64_t clock{0};
+    double demand_scale{1.0};
+    std::vector<double> demand;
+    std::vector<int64_t> last_seen;
+    std::vector<double> interval_ema;
+    int64_t call_index{-1};
+    std::vector<int64_t> route_last_seen;
+    std::vector<double> route_interval_ema;
+    double miss_pressure{0.0};
+  };
+
+  struct Victim {
+    bool valid{false};
+    bool shared{false};
+    size_t layer_index{0};
+    int64_t expert{-1};
+  };
+
+  LayerState& layer_state(int64_t layer) {
+    const auto iterator = layer_lookup_.find(layer);
+    if (iterator == layer_lookup_.end()) {
+      throw std::invalid_argument(
+          "ExpertSSD global-pool layer is unmanaged");
+    }
+    return layers_[iterator->second];
+  }
+
+  size_t key(size_t layer_index, int64_t expert) const {
+    return layer_index * expert_count_ + static_cast<size_t>(expert);
+  }
+
+  void validate_expert(int64_t expert) const {
+    if (expert < 0 || static_cast<size_t>(expert) >= expert_count_) {
+      throw std::invalid_argument(
+          "ExpertSSD global-pool expert id is out of range");
+    }
+  }
+
+  template <typename T>
+  void flatten_typed(
+      const mx::array& indices,
+      std::vector<int64_t>& output) const {
+    const auto* data = indices.data<T>();
+    const auto shape = indices.shape();
+    const auto strides = indices.strides();
+    output.reserve(indices.size());
+    std::vector<size_t> coordinates(shape.size(), 0);
+    for (size_t flat = 0; flat < indices.size(); ++flat) {
+      size_t physical = 0;
+      for (size_t dimension = 0; dimension < shape.size(); ++dimension) {
+        physical += coordinates[dimension] * strides[dimension];
+      }
+      output.push_back(static_cast<int64_t>(data[physical]));
+      for (int dimension = static_cast<int>(shape.size()) - 1;
+           dimension >= 0;
+           --dimension) {
+        coordinates[dimension] += 1;
+        if (coordinates[dimension] <
+            static_cast<size_t>(shape[dimension])) {
+          break;
+        }
+        coordinates[dimension] = 0;
+      }
+    }
+  }
+
+  void flatten(const mx::array& indices, std::vector<int64_t>& output) const {
+    if (indices.dtype() == mx::int32) {
+      flatten_typed<int32_t>(indices, output);
+    } else if (indices.dtype() == mx::int64) {
+      flatten_typed<int64_t>(indices, output);
+    } else if (indices.dtype() == mx::uint32) {
+      flatten_typed<uint32_t>(indices, output);
+    } else if (indices.dtype() == mx::uint64) {
+      flatten_typed<uint64_t>(indices, output);
+    } else {
+      throw std::invalid_argument(
+          "ExpertSSD global-pool indices must be integral");
+    }
+  }
+
+  void decay_retention(LayerState& state) const {
+    if (retention_decay_ == 0.0) {
+      std::fill(state.demand.begin(), state.demand.end(), 0.0);
+      state.demand_scale = 1.0;
+      return;
+    }
+    state.demand_scale *= retention_decay_;
+    if (state.demand_scale < 1e-6) {
+      for (auto& demand : state.demand) {
+        demand *= state.demand_scale;
+      }
+      state.demand_scale = 1.0;
+    }
+  }
+
+  void record_lhd_accesses(
+      LayerState& state,
+      const std::vector<int64_t>& experts,
+      const std::vector<int32_t>& counts) const {
+    for (size_t index = 0; index < experts.size(); ++index) {
+      const auto expert = experts[index];
+      ++state.clock;
+      const auto previous = state.last_seen[expert];
+      if (previous < 0) {
+        state.interval_ema[expert] = initial_interval_;
+      } else {
+        const auto interval = std::max<int64_t>(1, state.clock - previous);
+        state.interval_ema[expert] =
+            interval_alpha_ * static_cast<double>(interval) +
+            (1.0 - interval_alpha_) * state.interval_ema[expert];
+      }
+      state.last_seen[expert] = state.clock;
+      state.demand[expert] +=
+          static_cast<double>(counts[index]) / state.demand_scale;
+    }
+  }
+
+  void record_route_intervals(
+      LayerState& state,
+      const std::vector<int64_t>& experts) const {
+    for (const auto expert : experts) {
+      const auto previous = state.route_last_seen[expert];
+      if (previous < 0) {
+        state.route_interval_ema[expert] = initial_interval_;
+      } else {
+        const auto interval = std::max<int64_t>(1, state.call_index - previous);
+        state.route_interval_ema[expert] =
+            interval_alpha_ * static_cast<double>(interval) +
+            (1.0 - interval_alpha_) * state.route_interval_ema[expert];
+      }
+      state.route_last_seen[expert] = state.call_index;
+    }
+  }
+
+  double score(
+      const LayerState& state,
+      int64_t expert,
+      double markov_score) const {
+    const auto demand = state.demand[expert] * state.demand_scale;
+    const auto interval = std::max(1.0, state.interval_ema[expert]);
+    const auto previous = state.last_seen[expert];
+    const auto age = previous < 0
+        ? int64_t{1}
+        : std::max<int64_t>(1, state.clock - previous);
+    const auto density = demand /
+        (interval + age_weight_ * static_cast<double>(age));
+    const auto route_previous = state.route_last_seen[expert];
+    const auto remaining = route_previous < 0
+        ? initial_interval_
+        : std::max(
+            1.0,
+            static_cast<double>(route_previous) +
+                state.route_interval_ema[expert] -
+                static_cast<double>(state.call_index));
+    const auto markov_confidence =
+        1.0 + markov_boost_ * markov_score;
+    const auto predicted_remaining = remaining / markov_confidence;
+    const auto deadline_discount = std::pow(
+        predicted_remaining, deadline_weight_);
+    return density * markov_confidence *
+        (1.0 + miss_pressure_weight_ * state.miss_pressure) /
+        deadline_discount;
+  }
+
+  void refresh_layer_retention(
+      size_t layer_index,
+      const LayerState& state,
+      const std::vector<float>& markov_scores) {
+    for (size_t expert = 0; expert < expert_count_; ++expert) {
+      if (state.expert_to_row[expert] >= 0 ||
+          shared_rows_[key(layer_index, expert)] >= 0) {
+        retention_[key(layer_index, expert)] = score(
+            state, static_cast<int64_t>(expert), markov_scores[expert]);
+      }
+    }
+  }
+
+  void touch(size_t layer_index, int64_t expert) {
+    ++serial_;
+    last_access_[key(layer_index, expert)] = serial_;
+  }
+
+  bool worse(const Victim& lhs, const Victim& rhs) const {
+    if (!lhs.valid) {
+      return false;
+    }
+    if (!rhs.valid) {
+      return true;
+    }
+    const auto lhs_key = key(lhs.layer_index, lhs.expert);
+    const auto rhs_key = key(rhs.layer_index, rhs.expert);
+    if (retention_[lhs_key] != retention_[rhs_key]) {
+      return retention_[lhs_key] < retention_[rhs_key];
+    }
+    if (last_access_[lhs_key] != last_access_[rhs_key]) {
+      return last_access_[lhs_key] < last_access_[rhs_key];
+    }
+    const auto lhs_layer = layers_[lhs.layer_index].layer;
+    const auto rhs_layer = layers_[rhs.layer_index].layer;
+    return lhs_layer != rhs_layer
+        ? lhs_layer > rhs_layer
+        : lhs.expert > rhs.expert;
+  }
+
+  Victim choose_private_victim(
+      size_t layer_index,
+      const LayerState& state,
+      const std::vector<uint8_t>& protected_experts) const {
+    Victim best;
+    for (size_t expert = 0; expert < expert_count_; ++expert) {
+      if (state.expert_to_row[expert] < 0 || protected_experts[expert]) {
+        continue;
+      }
+      Victim candidate{
+          true, false, layer_index, static_cast<int64_t>(expert)};
+      if (!best.valid || worse(candidate, best)) {
+        best = candidate;
+      }
+    }
+    return best;
+  }
+
+  Victim choose_shared_victim(
+      size_t requesting_layer_index,
+      const std::vector<uint8_t>& protected_experts) const {
+    Victim best;
+    for (size_t layer_index = 0; layer_index < layers_.size(); ++layer_index) {
+      for (size_t expert = 0; expert < expert_count_; ++expert) {
+        if (shared_rows_[key(layer_index, expert)] < 0 ||
+            (layer_index == requesting_layer_index &&
+             protected_experts[expert])) {
+          continue;
+        }
+        Victim candidate{
+            true, true, layer_index, static_cast<int64_t>(expert)};
+        if (!best.valid || worse(candidate, best)) {
+          best = candidate;
+        }
+      }
+    }
+    return best;
+  }
+
+  int32_t remove(const Victim& victim) {
+    const auto resident_key = key(victim.layer_index, victim.expert);
+    int32_t row = -1;
+    if (victim.shared) {
+      row = shared_rows_[resident_key];
+      shared_rows_[resident_key] = -1;
+    } else {
+      auto& state = layers_[victim.layer_index];
+      row = state.expert_to_row[victim.expert];
+      state.expert_to_row[victim.expert] = -1;
+    }
+    retention_[resident_key] = 0.0;
+    last_access_[resident_key] = 0;
+    if (row < 0) {
+      throw std::invalid_argument(
+          "ExpertSSD global-pool victim row is missing");
+    }
+    return row;
+  }
+
+  size_t expert_count_;
+  size_t shared_capacity_;
+  double retention_decay_;
+  double interval_alpha_;
+  double initial_interval_;
+  double age_weight_;
+  double deadline_weight_;
+  double markov_boost_;
+  double miss_pressure_alpha_;
+  double miss_pressure_weight_;
+  std::vector<LayerState> layers_;
+  std::unordered_map<int64_t, size_t> layer_lookup_;
+  std::vector<int32_t> shared_rows_;
+  std::vector<int32_t> shared_free_rows_;
+  std::vector<double> retention_;
+  std::vector<uint64_t> last_access_;
+  uint64_t serial_{0};
+  size_t hits_{0};
+  size_t misses_{0};
+  size_t evictions_{0};
+  size_t private_evictions_{0};
+  size_t shared_evictions_{0};
+};
+
 mx::Dtype scalar_to_dtype(Scalar s) {
   if (std::holds_alternative<int>(s)) {
     return mx::int32;
@@ -1036,6 +1737,108 @@ void scalex_async_batch_run(void* raw) {
   mx::expert_ssd_io_event_signal(state->event_state, state->event_value);
 }
 
+struct ScaleXTwoBankAsyncBatchState {
+  ScaleXTwoBankAsyncBatchState(
+      std::shared_ptr<mx::ScaleXModeADirect> direct,
+      std::vector<size_t> expert_ids,
+      std::vector<uint8_t> shared_bank,
+      std::vector<size_t> rows,
+      std::array<mx::array, 4> private_destinations,
+      std::array<mx::array, 4> shared_destinations,
+      size_t worker_count,
+      bool interactive_qos,
+      std::shared_ptr<mx::ExpertSSDIoEventState> event_state,
+      uint64_t event_value)
+      : direct(std::move(direct)),
+        expert_ids(std::move(expert_ids)),
+        shared_bank(std::move(shared_bank)),
+        rows(std::move(rows)),
+        private_destinations(std::move(private_destinations)),
+        shared_destinations(std::move(shared_destinations)),
+        worker_count(worker_count),
+        interactive_qos(interactive_qos),
+        event_state(std::move(event_state)),
+        event_value(event_value) {}
+
+  std::shared_ptr<mx::ScaleXModeADirect> direct;
+  std::vector<size_t> expert_ids;
+  std::vector<uint8_t> shared_bank;
+  std::vector<size_t> rows;
+  std::array<mx::array, 4> private_destinations;
+  std::array<mx::array, 4> shared_destinations;
+  std::array<char*, 4> private_bases{};
+  std::array<char*, 4> shared_bases{};
+  size_t private_record_row_nbytes{0};
+  size_t shared_record_row_nbytes{0};
+  std::array<size_t, 3> row_nbytes{};
+  size_t worker_count{0};
+  bool interactive_qos{false};
+  std::shared_ptr<mx::ExpertSSDIoEventState> event_state;
+  uint64_t event_value{0};
+  std::atomic<size_t> next{0};
+  std::mutex error_mutex;
+  std::exception_ptr error;
+  std::mutex completion_mutex;
+  std::condition_variable completion_condition;
+  bool complete{false};
+};
+
+void scalex_two_bank_batch_worker(void* raw, size_t) {
+  auto* state = static_cast<ScaleXTwoBankAsyncBatchState*>(raw);
+  while (true) {
+    const size_t item = state->next.fetch_add(1);
+    if (item >= state->expert_ids.size()) {
+      return;
+    }
+    try {
+      const auto& bases = state->shared_bank[item]
+          ? state->shared_bases
+          : state->private_bases;
+      const auto record_row_nbytes = state->shared_bank[item]
+          ? state->shared_record_row_nbytes
+          : state->private_record_row_nbytes;
+      const auto row = state->rows[item];
+      const std::array<char*, 3> pointers{
+          bases[1] + row * state->row_nbytes[0],
+          bases[2] + row * state->row_nbytes[1],
+          bases[3] + row * state->row_nbytes[2]};
+      state->direct->load_compressed_expert_into(
+          state->expert_ids[item],
+          bases[0] + row * record_row_nbytes,
+          record_row_nbytes,
+          pointers,
+          state->row_nbytes);
+    } catch (...) {
+      std::lock_guard<std::mutex> lock(state->error_mutex);
+      if (!state->error) {
+        state->error = std::current_exception();
+      }
+      return;
+    }
+  }
+}
+
+void scalex_two_bank_batch_run(void* raw) {
+  std::unique_ptr<std::shared_ptr<ScaleXTwoBankAsyncBatchState>> owner(
+      static_cast<std::shared_ptr<ScaleXTwoBankAsyncBatchState>*>(raw));
+  auto state = *owner;
+  const auto queue = dispatch_get_global_queue(
+      state->interactive_qos ? QOS_CLASS_USER_INTERACTIVE
+                             : QOS_CLASS_USER_INITIATED,
+      0);
+  dispatch_apply_f(
+      std::min(state->worker_count, state->expert_ids.size()),
+      queue,
+      state.get(),
+      scalex_two_bank_batch_worker);
+  {
+    std::lock_guard<std::mutex> lock(state->completion_mutex);
+    state->complete = true;
+  }
+  state->completion_condition.notify_all();
+  mx::expert_ssd_io_event_signal(state->event_state, state->event_value);
+}
+
 void init_ops(nb::module_& m) {
   nb::class_<mx::ExpertSafetensorsDirect>(m, "_ExpertSafetensorsDirect");
   nb::class_<mx::ScaleXPrefixStore>(m, "_ScaleXPrefixStore");
@@ -1043,8 +1846,11 @@ void init_ops(nb::module_& m) {
   nb::class_<mx::SafetensorsRowDirect>(m, "_SafetensorsRowDirect");
   nb::class_<mx::ExpertSSDIoEventState>(m, "_ExpertSSDIoEventState");
   nb::class_<ScaleXAsyncBatchState>(m, "_ScaleXAsyncBatchState");
+  nb::class_<ScaleXTwoBankAsyncBatchState>(
+      m, "_ScaleXTwoBankAsyncBatchState");
   nb::class_<ExpertSSDMarkovState>(m, "_ExpertSSDMarkovState");
   nb::class_<ExpertSSDRouteCacheState>(m, "_ExpertSSDRouteCacheState");
+  nb::class_<ExpertSSDGlobalPoolState>(m, "_ExpertSSDGlobalPoolState");
   m.def(
       "_expert_ssd_markov_state_new",
       [](size_t expert_count, size_t history_limit) {
@@ -1258,6 +2064,189 @@ void init_ops(nb::module_& m) {
       nb::sig(
           "def _expert_ssd_route_cache_replay_all_hits(state: _ExpertSSDRouteCacheState, routes: list[list[int]]) -> None"));
   m.def(
+      "_expert_ssd_global_pool_state_new",
+      [](size_t expert_count,
+         const std::vector<int64_t>& layers,
+         const std::vector<int64_t>& private_capacities,
+         size_t shared_capacity,
+         double retention_decay,
+         double interval_alpha,
+         double initial_interval,
+         double age_weight,
+         double deadline_weight,
+         double markov_boost,
+         size_t markov_history,
+         double miss_pressure_alpha,
+         double miss_pressure_weight) {
+        return std::make_shared<ExpertSSDGlobalPoolState>(
+            expert_count,
+            layers,
+            private_capacities,
+            shared_capacity,
+            retention_decay,
+            interval_alpha,
+            initial_interval,
+            age_weight,
+            deadline_weight,
+            markov_boost,
+            markov_history,
+            miss_pressure_alpha,
+            miss_pressure_weight);
+      },
+      "expert_count"_a,
+      "layers"_a,
+      "private_capacities"_a,
+      "shared_capacity"_a,
+      "retention_decay"_a,
+      "interval_alpha"_a,
+      "initial_interval"_a,
+      "age_weight"_a,
+      "deadline_weight"_a,
+      "markov_boost"_a,
+      "markov_history"_a,
+      "miss_pressure_alpha"_a,
+      "miss_pressure_weight"_a,
+      nb::sig(
+          "def _expert_ssd_global_pool_state_new(expert_count: int, layers: list[int], private_capacities: list[int], shared_capacity: int, retention_decay: float, interval_alpha: float, initial_interval: float, age_weight: float, deadline_weight: float, markov_boost: float, markov_history: int, miss_pressure_alpha: float, miss_pressure_weight: float) -> _ExpertSSDGlobalPoolState"));
+  m.def(
+      "_expert_ssd_global_pool_plan",
+      [](std::shared_ptr<ExpertSSDGlobalPoolState> state,
+         int64_t layer,
+         mx::array indices) {
+        if (!state || indices.ndim() == 0) {
+          throw std::invalid_argument(
+              "ExpertSSD global-pool state and routed indices are required");
+        }
+        for (auto stride : indices.strides()) {
+          if (stride < 0) {
+            throw std::invalid_argument(
+                "ExpertSSD global-pool negative strides are unsupported");
+          }
+        }
+        ExpertSSDGlobalPoolPlan plan;
+        {
+          nb::gil_scoped_release release;
+          indices.eval();
+          plan = state->plan(layer, indices);
+        }
+        nb::dict output;
+        nb::list unique;
+        nb::dict counts;
+        nb::list routed;
+        nb::list shared_bank;
+        nb::list rows;
+        nb::list resident_before;
+        nb::list missing;
+        nb::list missing_shared_bank;
+        nb::list missing_rows;
+        nb::list evicted;
+        for (size_t index = 0; index < plan.unique.size(); ++index) {
+          const auto expert = plan.unique[index];
+          unique.append(nb::cast(expert));
+          counts[nb::cast(expert)] = nb::cast(plan.counts[index]);
+          shared_bank.append(nb::cast(bool(plan.shared_bank[index])));
+          rows.append(nb::cast(plan.rows[index]));
+          resident_before.append(nb::cast(bool(plan.resident_before[index])));
+        }
+        for (const auto expert : plan.routed) {
+          routed.append(nb::cast(expert));
+        }
+        for (size_t index = 0; index < plan.missing.size(); ++index) {
+          missing.append(nb::cast(plan.missing[index]));
+          missing_shared_bank.append(
+              nb::cast(bool(plan.missing_shared_bank[index])));
+          missing_rows.append(nb::cast(plan.missing_rows[index]));
+        }
+        for (size_t index = 0; index < plan.evicted_experts.size(); ++index) {
+          evicted.append(nb::make_tuple(
+              plan.evicted_layers[index], plan.evicted_experts[index]));
+        }
+        output["unique"] = unique;
+        output["counts"] = counts;
+        output["routed"] = routed;
+        output["compact"] = mx::array(
+            plan.compact.begin(), indices.shape(), indices.dtype());
+        output["shared_bank"] = shared_bank;
+        output["rows"] = rows;
+        output["resident_before"] = resident_before;
+        output["missing"] = missing;
+        output["missing_shared_bank"] = missing_shared_bank;
+        output["missing_rows"] = missing_rows;
+        output["evicted"] = evicted;
+        output["hits"] = plan.hits;
+        output["misses"] = plan.misses;
+        return output;
+      },
+      "state"_a,
+      "layer"_a,
+      "indices"_a,
+      nb::sig(
+          "def _expert_ssd_global_pool_plan(state: _ExpertSSDGlobalPoolState, layer: int, indices: array) -> dict"));
+  m.def(
+      "_expert_ssd_global_pool_restore_rows",
+      [](std::shared_ptr<ExpertSSDGlobalPoolState> state,
+         const std::vector<std::vector<int64_t>>& private_assignments,
+         const std::vector<std::vector<int64_t>>& shared_assignments) {
+        if (!state) {
+          throw std::invalid_argument(
+              "ExpertSSD global-pool state is required");
+        }
+        nb::gil_scoped_release release;
+        state->restore_rows(private_assignments, shared_assignments);
+      },
+      "state"_a,
+      "private_assignments"_a,
+      "shared_assignments"_a,
+      nb::sig(
+          "def _expert_ssd_global_pool_restore_rows(state: _ExpertSSDGlobalPoolState, private_assignments: list[list[int]], shared_assignments: list[list[int]]) -> None"));
+  m.def(
+      "_expert_ssd_global_pool_restore_layer_policy",
+      [](std::shared_ptr<ExpertSSDGlobalPoolState> state,
+         int64_t layer,
+         int64_t clock,
+         double demand_scale,
+         const std::vector<double>& demand,
+         const std::vector<int64_t>& last_seen,
+         const std::vector<double>& interval_ema,
+         nb::bytes markov_payload) {
+        if (!state) {
+          throw std::invalid_argument(
+              "ExpertSSD global-pool state is required");
+        }
+        const std::string payload(markov_payload.c_str(), markov_payload.size());
+        nb::gil_scoped_release release;
+        state->restore_layer_policy(
+            layer,
+            clock,
+            demand_scale,
+            demand,
+            last_seen,
+            interval_ema,
+            payload);
+      },
+      "state"_a,
+      "layer"_a,
+      "clock"_a,
+      "demand_scale"_a,
+      "demand"_a,
+      "last_seen"_a,
+      "interval_ema"_a,
+      "markov_payload"_a,
+      nb::sig(
+          "def _expert_ssd_global_pool_restore_layer_policy(state: _ExpertSSDGlobalPoolState, layer: int, clock: int, demand_scale: float, demand: list[float], last_seen: list[int], interval_ema: list[float], markov_payload: bytes) -> None"));
+  m.def(
+      "_expert_ssd_global_pool_metadata",
+      [](std::shared_ptr<ExpertSSDGlobalPoolState> state) {
+        if (!state) {
+          throw std::invalid_argument(
+              "ExpertSSD global-pool state is required");
+        }
+        return state->metadata();
+      },
+      "state"_a,
+      nb::sig(
+          "def _expert_ssd_global_pool_metadata(state: _ExpertSSDGlobalPoolState) -> dict"));
+  m.def(
       "_expert_ssd_io_event_state_new",
       []() { return mx::expert_ssd_io_event_state_new(); },
       nb::sig(
@@ -1433,6 +2422,36 @@ void init_ops(nb::module_& m) {
       nb::sig(
           "def _expert_ssd_scalex_mxfp4_qmv(x: array, weight: array, scale_records: array, routes: array, projection: int) -> array"));
   m.def(
+      "_expert_ssd_scalex_mxfp4_qmv_two_bank",
+      [](const mx::array& x,
+         const mx::array& private_weight,
+         const mx::array& private_scale_records,
+         const mx::array& shared_weight,
+         const mx::array& shared_scale_records,
+         const mx::array& routes,
+         const mx::array& bank_routes,
+         uint32_t projection) {
+        return mx::expert_ssd_scalex_mxfp4_qmv_two_bank(
+            x,
+            private_weight,
+            private_scale_records,
+            shared_weight,
+            shared_scale_records,
+            routes,
+            bank_routes,
+            projection);
+      },
+      "x"_a,
+      "private_weight"_a,
+      "private_scale_records"_a,
+      "shared_weight"_a,
+      "shared_scale_records"_a,
+      "routes"_a,
+      "bank_routes"_a,
+      "projection"_a,
+      nb::sig(
+          "def _expert_ssd_scalex_mxfp4_qmv_two_bank(x: array, private_weight: array, private_scale_records: array, shared_weight: array, shared_scale_records: array, routes: array, bank_routes: array, projection: int) -> array"));
+  m.def(
       "_expert_ssd_scalex_mxfp4_qmv_split_routes",
       [](const mx::array& x,
          const mx::array& weight,
@@ -1451,6 +2470,39 @@ void init_ops(nb::module_& m) {
       "projection"_a,
       nb::sig(
           "def _expert_ssd_scalex_mxfp4_qmv_split_routes(x: array, weight: array, scale_records: array, weight_routes: array, scale_routes: array, projection: int) -> array"));
+  m.def(
+      "_expert_ssd_scalex_mxfp4_qmv_split_routes_two_bank",
+      [](const mx::array& x,
+         const mx::array& private_weight,
+         const mx::array& private_scale_records,
+         const mx::array& shared_weight,
+         const mx::array& shared_scale_records,
+         const mx::array& weight_routes,
+         const mx::array& scale_routes,
+         const mx::array& bank_routes,
+         uint32_t projection) {
+        return mx::expert_ssd_scalex_mxfp4_qmv_split_routes_two_bank(
+            x,
+            private_weight,
+            private_scale_records,
+            shared_weight,
+            shared_scale_records,
+            weight_routes,
+            scale_routes,
+            bank_routes,
+            projection);
+      },
+      "x"_a,
+      "private_weight"_a,
+      "private_scale_records"_a,
+      "shared_weight"_a,
+      "shared_scale_records"_a,
+      "weight_routes"_a,
+      "scale_routes"_a,
+      "bank_routes"_a,
+      "projection"_a,
+      nb::sig(
+          "def _expert_ssd_scalex_mxfp4_qmv_split_routes_two_bank(x: array, private_weight: array, private_scale_records: array, shared_weight: array, shared_scale_records: array, weight_routes: array, scale_routes: array, bank_routes: array, projection: int) -> array"));
   m.def(
       "_expert_ssd_scalex_mxfp4_width2_down_reduce",
       [](const mx::array& x,
@@ -1479,6 +2531,42 @@ void init_ops(nb::module_& m) {
       nb::sig(
           "def _expert_ssd_scalex_mxfp4_width2_down_reduce(x: array, weight: array, scale_records: array, weight_routes: array, scale_routes: array, scores: array, shared: array) -> array"));
   m.def(
+      "_expert_ssd_scalex_mxfp4_width2_down_reduce_two_bank",
+      [](const mx::array& x,
+         const mx::array& private_weight,
+         const mx::array& private_scale_records,
+         const mx::array& shared_weight,
+         const mx::array& shared_scale_records,
+         const mx::array& weight_routes,
+         const mx::array& scale_routes,
+         const mx::array& bank_routes,
+         const mx::array& scores,
+         const mx::array& shared) {
+        return mx::expert_ssd_scalex_mxfp4_width2_down_reduce_two_bank(
+            x,
+            private_weight,
+            private_scale_records,
+            shared_weight,
+            shared_scale_records,
+            weight_routes,
+            scale_routes,
+            bank_routes,
+            scores,
+            shared);
+      },
+      "x"_a,
+      "private_weight"_a,
+      "private_scale_records"_a,
+      "shared_weight"_a,
+      "shared_scale_records"_a,
+      "weight_routes"_a,
+      "scale_routes"_a,
+      "bank_routes"_a,
+      "scores"_a,
+      "shared"_a,
+      nb::sig(
+          "def _expert_ssd_scalex_mxfp4_width2_down_reduce_two_bank(x: array, private_weight: array, private_scale_records: array, shared_weight: array, shared_scale_records: array, weight_routes: array, scale_routes: array, bank_routes: array, scores: array, shared: array) -> array"));
+  m.def(
       "_expert_ssd_scalex_mxfp4_width3_down_reduce",
       [](const mx::array& x,
          const mx::array& weight,
@@ -1505,6 +2593,42 @@ void init_ops(nb::module_& m) {
       "shared"_a,
       nb::sig(
           "def _expert_ssd_scalex_mxfp4_width3_down_reduce(x: array, weight: array, scale_records: array, weight_routes: array, scale_routes: array, scores: array, shared: array) -> array"));
+  m.def(
+      "_expert_ssd_scalex_mxfp4_width3_down_reduce_two_bank",
+      [](const mx::array& x,
+         const mx::array& private_weight,
+         const mx::array& private_scale_records,
+         const mx::array& shared_weight,
+         const mx::array& shared_scale_records,
+         const mx::array& weight_routes,
+         const mx::array& scale_routes,
+         const mx::array& bank_routes,
+         const mx::array& scores,
+         const mx::array& shared) {
+        return mx::expert_ssd_scalex_mxfp4_width3_down_reduce_two_bank(
+            x,
+            private_weight,
+            private_scale_records,
+            shared_weight,
+            shared_scale_records,
+            weight_routes,
+            scale_routes,
+            bank_routes,
+            scores,
+            shared);
+      },
+      "x"_a,
+      "private_weight"_a,
+      "private_scale_records"_a,
+      "shared_weight"_a,
+      "shared_scale_records"_a,
+      "weight_routes"_a,
+      "scale_routes"_a,
+      "bank_routes"_a,
+      "scores"_a,
+      "shared"_a,
+      nb::sig(
+          "def _expert_ssd_scalex_mxfp4_width3_down_reduce_two_bank(x: array, private_weight: array, private_scale_records: array, shared_weight: array, shared_scale_records: array, weight_routes: array, scale_routes: array, bank_routes: array, scores: array, shared: array) -> array"));
   m.def(
       "_expert_ssd_scalex_conditional_m0",
       [](const mx::array& indices,
@@ -2336,6 +3460,165 @@ void init_ops(nb::module_& m) {
       "state"_a,
       nb::sig(
           "def _scalex_mode_b_async_wait(state: _ScaleXAsyncBatchState) -> None"));
+  m.def(
+      "_scalex_mode_b_load_full_split_two_bank_async",
+      [](std::shared_ptr<mx::ScaleXModeADirect> direct,
+         std::vector<size_t> expert_ids,
+         std::vector<uint8_t> shared_bank,
+         std::vector<size_t> rows,
+         mx::array private_record,
+         mx::array private_gate,
+         mx::array private_down,
+         mx::array private_up,
+         mx::array shared_record,
+         mx::array shared_gate,
+         mx::array shared_down,
+         mx::array shared_up,
+         const std::vector<size_t>& weight_row_nbytes,
+         size_t worker_count,
+         bool interactive_qos,
+         std::shared_ptr<mx::ExpertSSDIoEventState> event_state,
+         uint64_t event_value) {
+        if (!direct || !event_state || event_value == 0 ||
+            expert_ids.empty() || expert_ids.size() != shared_bank.size() ||
+            expert_ids.size() != rows.size() || weight_row_nbytes.size() != 3 ||
+            worker_count == 0) {
+          throw std::invalid_argument(
+              "[_scalex_mode_b_load_full_split_two_bank_async] invalid arguments");
+        }
+        std::array<mx::array, 4> private_destinations{
+            std::move(private_record),
+            std::move(private_gate),
+            std::move(private_down),
+            std::move(private_up)};
+        std::array<mx::array, 4> shared_destinations{
+            std::move(shared_record),
+            std::move(shared_gate),
+            std::move(shared_down),
+            std::move(shared_up)};
+        const auto validate_bank = [&](std::array<mx::array, 4>& destinations) {
+          if (destinations[0].ndim() != 2 ||
+              destinations[0].dtype() != mx::uint8 ||
+              destinations[1].dtype() != mx::uint32 ||
+              destinations[2].dtype() != mx::uint32 ||
+              destinations[3].dtype() != mx::uint32 ||
+              destinations[1].ndim() != 3 || destinations[2].ndim() != 3 ||
+              destinations[3].ndim() != 3) {
+            throw std::invalid_argument(
+                "[_scalex_mode_b_load_full_split_two_bank_async] invalid bank arrays");
+          }
+          const size_t capacity = destinations[0].shape(0);
+          if (capacity == 0 || destinations[1].shape(0) != capacity ||
+              destinations[2].shape(0) != capacity ||
+              destinations[3].shape(0) != capacity) {
+            throw std::invalid_argument(
+                "[_scalex_mode_b_load_full_split_two_bank_async] bank capacities differ");
+          }
+          for (auto& destination : destinations) {
+            if (!destination.is_available()) {
+              destination.eval();
+            }
+            if (!destination.flags().row_contiguous) {
+              throw std::invalid_argument(
+                  "[_scalex_mode_b_load_full_split_two_bank_async] destinations must be row-contiguous");
+            }
+          }
+          const size_t record_row_nbytes =
+              destinations[0].nbytes() / capacity;
+          if (record_row_nbytes < direct->maximum_indexed_nbytes() ||
+              destinations[1].nbytes() / capacity != weight_row_nbytes[0] ||
+              destinations[2].nbytes() / capacity != weight_row_nbytes[1] ||
+              destinations[3].nbytes() / capacity != weight_row_nbytes[2]) {
+            throw std::invalid_argument(
+                "[_scalex_mode_b_load_full_split_two_bank_async] row geometry changed");
+          }
+          return record_row_nbytes;
+        };
+        const auto private_record_nbytes = validate_bank(private_destinations);
+        const auto shared_record_nbytes = validate_bank(shared_destinations);
+        const auto private_capacity = private_destinations[0].shape(0);
+        const auto shared_capacity = shared_destinations[0].shape(0);
+        for (size_t item = 0; item < rows.size(); ++item) {
+          if (rows[item] >=
+              (shared_bank[item] ? shared_capacity : private_capacity)) {
+            throw std::out_of_range(
+                "[_scalex_mode_b_load_full_split_two_bank_async] row is out of range");
+          }
+        }
+        auto state = std::make_shared<ScaleXTwoBankAsyncBatchState>(
+            std::move(direct),
+            std::move(expert_ids),
+            std::move(shared_bank),
+            std::move(rows),
+            std::move(private_destinations),
+            std::move(shared_destinations),
+            worker_count,
+            interactive_qos,
+            std::move(event_state),
+            event_value);
+        state->private_record_row_nbytes = private_record_nbytes;
+        state->shared_record_row_nbytes = shared_record_nbytes;
+        state->row_nbytes = {
+            weight_row_nbytes[0],
+            weight_row_nbytes[1],
+            weight_row_nbytes[2]};
+        for (size_t index = 0; index < 4; ++index) {
+          state->private_bases[index] =
+              state->private_destinations[index].data<char>();
+          state->shared_bases[index] =
+              state->shared_destinations[index].data<char>();
+        }
+        dispatch_async_f(
+            dispatch_get_global_queue(
+                interactive_qos ? QOS_CLASS_USER_INTERACTIVE
+                                : QOS_CLASS_USER_INITIATED,
+                0),
+            new std::shared_ptr<ScaleXTwoBankAsyncBatchState>(state),
+            scalex_two_bank_batch_run);
+        return state;
+      },
+      "direct"_a,
+      "expert_ids"_a,
+      "shared_bank"_a,
+      "rows"_a,
+      "private_record"_a,
+      "private_gate"_a,
+      "private_down"_a,
+      "private_up"_a,
+      "shared_record"_a,
+      "shared_gate"_a,
+      "shared_down"_a,
+      "shared_up"_a,
+      "weight_row_nbytes"_a,
+      "worker_count"_a,
+      "interactive_qos"_a,
+      "event_state"_a,
+      "event_value"_a,
+      nb::sig(
+          "def _scalex_mode_b_load_full_split_two_bank_async(direct: _ScaleXModeADirect, expert_ids: list[int], shared_bank: list[bool], rows: list[int], private_record: array, private_gate: array, private_down: array, private_up: array, shared_record: array, shared_gate: array, shared_down: array, shared_up: array, weight_row_nbytes: list[int], worker_count: int, interactive_qos: bool, event_state: _ExpertSSDIoEventState, event_value: int) -> _ScaleXTwoBankAsyncBatchState"));
+  m.def(
+      "_scalex_mode_b_two_bank_async_wait",
+      [](const std::shared_ptr<ScaleXTwoBankAsyncBatchState>& state) {
+        if (!state) {
+          throw std::invalid_argument(
+              "[_scalex_mode_b_two_bank_async_wait] state required");
+        }
+        std::exception_ptr error;
+        {
+          nb::gil_scoped_release release;
+          std::unique_lock<std::mutex> lock(state->completion_mutex);
+          state->completion_condition.wait(
+              lock, [&]() { return state->complete; });
+          std::lock_guard<std::mutex> error_lock(state->error_mutex);
+          error = state->error;
+        }
+        if (error) {
+          std::rethrow_exception(error);
+        }
+      },
+      "state"_a,
+      nb::sig(
+          "def _scalex_mode_b_two_bank_async_wait(state: _ScaleXTwoBankAsyncBatchState) -> None"));
   m.def(
       "_scalex_mode_b_load_full_split_chunk",
       [](std::shared_ptr<mx::ScaleXModeADirect> direct,
