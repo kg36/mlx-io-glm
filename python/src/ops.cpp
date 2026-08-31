@@ -2199,6 +2199,110 @@ struct ScaleXAsyncBatchState {
   bool complete{false};
 };
 
+struct ScaleXModeAAsyncBatchState {
+  ScaleXModeAAsyncBatchState(
+      std::shared_ptr<mx::ScaleXModeADirect> direct,
+      std::vector<size_t> expert_ids,
+      std::vector<size_t> slots,
+      std::vector<mx::array> scale_destinations,
+      std::vector<mx::array> weight_destinations,
+      size_t worker_count,
+      bool interactive_qos,
+      std::shared_ptr<mx::ExpertSSDIoEventState> event_state,
+      uint64_t wait_value,
+      uint64_t event_value)
+      : direct(std::move(direct)),
+        expert_ids(std::move(expert_ids)),
+        slots(std::move(slots)),
+        scale_destinations(std::move(scale_destinations)),
+        weight_destinations(std::move(weight_destinations)),
+        worker_count(worker_count),
+        interactive_qos(interactive_qos),
+        event_state(std::move(event_state)),
+        wait_value(wait_value),
+        event_value(event_value) {}
+
+  std::shared_ptr<mx::ScaleXModeADirect> direct;
+  std::vector<size_t> expert_ids;
+  std::vector<size_t> slots;
+  std::vector<mx::array> scale_destinations;
+  std::vector<mx::array> weight_destinations;
+  std::array<char*, 3> scale_bases{};
+  std::array<char*, 3> weight_bases{};
+  std::array<size_t, 3> scale_row_nbytes{};
+  std::array<size_t, 3> weight_row_nbytes{};
+  size_t worker_count{0};
+  bool interactive_qos{false};
+  std::shared_ptr<mx::ExpertSSDIoEventState> event_state;
+  uint64_t wait_value{0};
+  uint64_t event_value{0};
+  std::atomic<size_t> next{0};
+  std::mutex error_mutex;
+  std::exception_ptr error;
+  std::mutex completion_mutex;
+  std::condition_variable completion_condition;
+  bool complete{false};
+};
+
+void scalex_mode_a_async_batch_worker(void* raw, size_t) {
+  auto* state = static_cast<ScaleXModeAAsyncBatchState*>(raw);
+  while (true) {
+    const size_t item = state->next.fetch_add(1);
+    if (item >= state->expert_ids.size()) {
+      return;
+    }
+    try {
+      const auto slot = state->slots[item];
+      std::array<char*, 3> scale_pointers{};
+      std::array<char*, 3> weight_pointers{};
+      for (size_t tensor = 0; tensor < 3; ++tensor) {
+        scale_pointers[tensor] = state->scale_bases[tensor] +
+            slot * state->scale_row_nbytes[tensor];
+        weight_pointers[tensor] = state->weight_bases[tensor] +
+            slot * state->weight_row_nbytes[tensor];
+      }
+      state->direct->load_expert_into(
+          state->expert_ids[item],
+          scale_pointers,
+          state->scale_row_nbytes,
+          weight_pointers,
+          state->weight_row_nbytes);
+    } catch (...) {
+      std::lock_guard<std::mutex> lock(state->error_mutex);
+      if (!state->error) {
+        state->error = std::current_exception();
+      }
+      return;
+    }
+  }
+}
+
+void scalex_mode_a_async_batch_run(void* raw) {
+  std::unique_ptr<std::shared_ptr<ScaleXModeAAsyncBatchState>> owner(
+      static_cast<std::shared_ptr<ScaleXModeAAsyncBatchState>*>(raw));
+  auto state = *owner;
+  if (state->wait_value != 0) {
+    mx::expert_ssd_io_event_wait(state->event_state, state->wait_value);
+  }
+  const auto queue = dispatch_get_global_queue(
+      state->interactive_qos ? QOS_CLASS_USER_INTERACTIVE
+                             : QOS_CLASS_USER_INITIATED,
+      0);
+  dispatch_apply_f(
+      std::min(state->worker_count, state->expert_ids.size()),
+      queue,
+      state.get(),
+      scalex_mode_a_async_batch_worker);
+  {
+    std::lock_guard<std::mutex> lock(state->completion_mutex);
+    state->complete = true;
+  }
+  state->completion_condition.notify_all();
+  // Release dependent Metal work even when one native read failed. The
+  // explicit host waiter rethrows before this destination bank is reused.
+  mx::expert_ssd_io_event_signal(state->event_state, state->event_value);
+}
+
 void scalex_async_batch_worker(void* raw, size_t) {
   auto* state = static_cast<ScaleXAsyncBatchState*>(raw);
   const bool striped = state->direct->replica_count() == 2;
@@ -2485,6 +2589,8 @@ void init_ops(nb::module_& m) {
   nb::class_<mx::SafetensorsRowDirect>(m, "_SafetensorsRowDirect");
   nb::class_<mx::ExpertSSDIoEventState>(m, "_ExpertSSDIoEventState");
   nb::class_<ScaleXAsyncBatchState>(m, "_ScaleXAsyncBatchState");
+  nb::class_<ScaleXModeAAsyncBatchState>(
+      m, "_ScaleXModeAAsyncBatchState");
   nb::class_<ScaleXTwoBankAsyncBatchState>(
       m, "_ScaleXTwoBankAsyncBatchState");
   nb::class_<ExpertSSDMarkovState>(m, "_ExpertSSDMarkovState");
@@ -4066,6 +4172,100 @@ void init_ops(nb::module_& m) {
       "weight_destinations"_a,
       nb::sig(
           "def _scalex_mode_a_load_experts_into_many(direct: _ScaleXModeADirect, expert_ids: list[int], slots: list[int], scale_destinations: list[array], weight_destinations: list[array]) -> None"));
+  m.def(
+      "_scalex_mode_a_load_experts_async",
+      [](std::shared_ptr<mx::ScaleXModeADirect> direct,
+         std::vector<size_t> expert_ids,
+         std::vector<size_t> slots,
+         std::vector<mx::array> scale_destinations,
+         std::vector<mx::array> weight_destinations,
+         size_t worker_count,
+         bool interactive_qos,
+         std::shared_ptr<mx::ExpertSSDIoEventState> event_state,
+         uint64_t wait_value,
+         uint64_t event_value) {
+        if (!direct || !event_state || event_value == 0 ||
+            expert_ids.empty() || expert_ids.size() != slots.size() ||
+            worker_count == 0 || wait_value >= event_value) {
+          throw std::invalid_argument(
+              "[_scalex_mode_a_load_experts_async] invalid arguments");
+        }
+        const auto scales = validate_scalex_destinations(
+            scale_destinations,
+            mx::uint8,
+            &direct->decoded_tensor_nbytes());
+        const auto weights = validate_scalex_destinations(
+            weight_destinations, mx::uint32);
+        if (weights.capacity != scales.capacity) {
+          throw std::invalid_argument(
+              "[_scalex_mode_a_load_experts_async] scale/weight capacities differ");
+        }
+        for (auto slot : slots) {
+          if (slot >= scales.capacity) {
+            throw std::out_of_range(
+                "[_scalex_mode_a_load_experts_async] destination slot is out of range");
+          }
+        }
+
+        auto state = std::make_shared<ScaleXModeAAsyncBatchState>(
+            std::move(direct),
+            std::move(expert_ids),
+            std::move(slots),
+            std::move(scale_destinations),
+            std::move(weight_destinations),
+            worker_count,
+            interactive_qos,
+            std::move(event_state),
+            wait_value,
+            event_value);
+        state->scale_bases = scales.bases;
+        state->weight_bases = weights.bases;
+        state->scale_row_nbytes = scales.row_nbytes;
+        state->weight_row_nbytes = weights.row_nbytes;
+        dispatch_async_f(
+            dispatch_get_global_queue(
+                interactive_qos ? QOS_CLASS_USER_INTERACTIVE
+                                : QOS_CLASS_USER_INITIATED,
+                0),
+            new std::shared_ptr<ScaleXModeAAsyncBatchState>(state),
+            scalex_mode_a_async_batch_run);
+        return state;
+      },
+      "direct"_a,
+      "expert_ids"_a,
+      "slots"_a,
+      "scale_destinations"_a,
+      "weight_destinations"_a,
+      "worker_count"_a,
+      "interactive_qos"_a,
+      "event_state"_a,
+      "wait_value"_a,
+      "event_value"_a,
+      nb::sig(
+          "def _scalex_mode_a_load_experts_async(direct: _ScaleXModeADirect, expert_ids: list[int], slots: list[int], scale_destinations: list[array], weight_destinations: list[array], worker_count: int, interactive_qos: bool, event_state: _ExpertSSDIoEventState, wait_value: int, event_value: int) -> _ScaleXModeAAsyncBatchState"));
+  m.def(
+      "_scalex_mode_a_async_wait",
+      [](const std::shared_ptr<ScaleXModeAAsyncBatchState>& state) {
+        if (!state) {
+          throw std::invalid_argument(
+              "[_scalex_mode_a_async_wait] state required");
+        }
+        std::exception_ptr error;
+        {
+          nb::gil_scoped_release release;
+          std::unique_lock<std::mutex> lock(state->completion_mutex);
+          state->completion_condition.wait(
+              lock, [&]() { return state->complete; });
+          std::lock_guard<std::mutex> error_lock(state->error_mutex);
+          error = state->error;
+        }
+        if (error) {
+          std::rethrow_exception(error);
+        }
+      },
+      "state"_a,
+      nb::sig(
+          "def _scalex_mode_a_async_wait(state: _ScaleXModeAAsyncBatchState) -> None"));
   m.def(
       "_scalex_mode_b_load_experts_into_many",
       [](std::shared_ptr<mx::ScaleXModeADirect> direct,
