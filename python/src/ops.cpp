@@ -733,6 +733,7 @@ class ExpertSSDGlobalPoolState {
         age_weight_(age_weight),
         deadline_weight_(deadline_weight),
         markov_boost_(markov_boost),
+        markov_history_(markov_history),
         miss_pressure_alpha_(miss_pressure_alpha),
         miss_pressure_weight_(miss_pressure_weight) {
     if (expert_count_ == 0 || layers.empty() ||
@@ -1116,6 +1117,62 @@ class ExpertSSDGlobalPoolState {
     }
   }
 
+  std::string serialize_policy() const {
+    std::string output("DSGP1", 5);
+    append_policy(output, static_cast<uint32_t>(expert_count_));
+    append_policy(output, static_cast<uint32_t>(layers_.size()));
+    append_policy(output, static_cast<uint32_t>(shared_capacity_));
+    append_policy(output, serial_);
+    for (const auto& state : layers_) {
+      append_policy(output, state.layer);
+      append_policy(output, static_cast<uint32_t>(state.capacity));
+      append_policy(output, state.clock);
+      append_policy(output, state.demand_scale);
+      append_policy_vector(output, state.demand);
+      append_policy_vector(output, state.last_seen);
+      append_policy_vector(output, state.interval_ema);
+      append_policy(output, state.call_index);
+      append_policy_vector(output, state.route_last_seen);
+      append_policy_vector(output, state.route_interval_ema);
+      append_policy(output, state.miss_pressure);
+      const auto markov = state.markov->serialize();
+      append_policy(output, static_cast<uint64_t>(markov.size()));
+      output.append(markov);
+    }
+    append_policy_vector(output, retention_);
+    append_policy_vector(output, last_access_);
+    return output;
+  }
+
+  void validate_policy_snapshot(const std::string& payload) const {
+    (void)parse_policy_snapshot(payload);
+  }
+
+  void restore_policy_snapshot(const std::string& payload) {
+    if (hits_ != 0 || misses_ != 0 || evictions_ != 0) {
+      throw std::invalid_argument(
+          "ExpertSSD global-pool exact policy restore requires unused state");
+    }
+    auto parsed = parse_policy_snapshot(payload);
+    serial_ = parsed.serial;
+    retention_ = std::move(parsed.retention);
+    last_access_ = std::move(parsed.last_access);
+    for (size_t index = 0; index < layers_.size(); ++index) {
+      auto& state = layers_[index];
+      auto& saved = parsed.layers[index];
+      state.clock = saved.clock;
+      state.demand_scale = saved.demand_scale;
+      state.demand = std::move(saved.demand);
+      state.last_seen = std::move(saved.last_seen);
+      state.interval_ema = std::move(saved.interval_ema);
+      state.call_index = saved.call_index;
+      state.route_last_seen = std::move(saved.route_last_seen);
+      state.route_interval_ema = std::move(saved.route_interval_ema);
+      state.miss_pressure = saved.miss_pressure;
+      state.markov->restore(saved.markov);
+    }
+  }
+
   nb::dict metadata() const {
     nb::dict output;
     nb::list layer_entries;
@@ -1157,6 +1214,177 @@ class ExpertSSDGlobalPoolState {
   }
 
  private:
+  struct SavedLayerPolicy {
+    int64_t clock{0};
+    double demand_scale{1.0};
+    std::vector<double> demand;
+    std::vector<int64_t> last_seen;
+    std::vector<double> interval_ema;
+    int64_t call_index{-1};
+    std::vector<int64_t> route_last_seen;
+    std::vector<double> route_interval_ema;
+    double miss_pressure{0.0};
+    std::string markov;
+  };
+
+  struct SavedPolicy {
+    uint64_t serial{0};
+    std::vector<SavedLayerPolicy> layers;
+    std::vector<double> retention;
+    std::vector<uint64_t> last_access;
+  };
+
+  template <typename T>
+  static void append_policy(std::string& output, const T& value) {
+    output.append(reinterpret_cast<const char*>(&value), sizeof(T));
+  }
+
+  template <typename T>
+  static void append_policy_vector(
+      std::string& output,
+      const std::vector<T>& values) {
+    output.append(
+        reinterpret_cast<const char*>(values.data()),
+        values.size() * sizeof(T));
+  }
+
+  template <typename T>
+  static T read_policy(const std::string& payload, size_t& offset) {
+    if (offset > payload.size() || payload.size() - offset < sizeof(T)) {
+      throw std::invalid_argument(
+          "ExpertSSD global-pool policy snapshot is truncated");
+    }
+    T value;
+    std::memcpy(&value, payload.data() + offset, sizeof(T));
+    offset += sizeof(T);
+    return value;
+  }
+
+  template <typename T>
+  static std::vector<T> read_policy_vector(
+      const std::string& payload,
+      size_t& offset,
+      size_t count) {
+    if (count > (payload.size() - std::min(offset, payload.size())) / sizeof(T)) {
+      throw std::invalid_argument(
+          "ExpertSSD global-pool policy vector is truncated");
+    }
+    std::vector<T> values(count);
+    if (count != 0) {
+      std::memcpy(
+          values.data(), payload.data() + offset, count * sizeof(T));
+    }
+    offset += count * sizeof(T);
+    return values;
+  }
+
+  SavedPolicy parse_policy_snapshot(const std::string& payload) const {
+    if (payload.size() < 5 || payload.compare(0, 5, "DSGP1") != 0) {
+      throw std::invalid_argument(
+          "ExpertSSD global-pool policy snapshot has wrong format");
+    }
+    size_t offset = 5;
+    const auto expert_count = read_policy<uint32_t>(payload, offset);
+    const auto layer_count = read_policy<uint32_t>(payload, offset);
+    const auto shared_capacity = read_policy<uint32_t>(payload, offset);
+    if (expert_count != expert_count_ || layer_count != layers_.size() ||
+        shared_capacity != shared_capacity_) {
+      throw std::invalid_argument(
+          "ExpertSSD global-pool policy dimensions are incompatible");
+    }
+    SavedPolicy output;
+    output.serial = read_policy<uint64_t>(payload, offset);
+    output.layers.reserve(layers_.size());
+    for (const auto& current : layers_) {
+      const auto layer = read_policy<int64_t>(payload, offset);
+      const auto capacity = read_policy<uint32_t>(payload, offset);
+      if (layer != current.layer || capacity != current.capacity) {
+        throw std::invalid_argument(
+            "ExpertSSD global-pool policy layer geometry differs");
+      }
+      SavedLayerPolicy saved;
+      saved.clock = read_policy<int64_t>(payload, offset);
+      saved.demand_scale = read_policy<double>(payload, offset);
+      saved.demand = read_policy_vector<double>(
+          payload, offset, expert_count_);
+      saved.last_seen = read_policy_vector<int64_t>(
+          payload, offset, expert_count_);
+      saved.interval_ema = read_policy_vector<double>(
+          payload, offset, expert_count_);
+      saved.call_index = read_policy<int64_t>(payload, offset);
+      saved.route_last_seen = read_policy_vector<int64_t>(
+          payload, offset, expert_count_);
+      saved.route_interval_ema = read_policy_vector<double>(
+          payload, offset, expert_count_);
+      saved.miss_pressure = read_policy<double>(payload, offset);
+      const auto markov_size = read_policy<uint64_t>(payload, offset);
+      if (markov_size > payload.size() - std::min(offset, payload.size())) {
+        throw std::invalid_argument(
+            "ExpertSSD global-pool Markov snapshot is truncated");
+      }
+      saved.markov.assign(payload.data() + offset, markov_size);
+      offset += markov_size;
+
+      if (saved.clock < 0 || !std::isfinite(saved.demand_scale) ||
+          saved.demand_scale <= 0.0 || saved.call_index < -1 ||
+          !std::isfinite(saved.miss_pressure) || saved.miss_pressure < 0.0 ||
+          saved.miss_pressure > 1.0 ||
+          std::any_of(saved.demand.begin(), saved.demand.end(), [](double value) {
+            return !std::isfinite(value) || value < 0.0;
+          }) ||
+          std::any_of(
+              saved.interval_ema.begin(),
+              saved.interval_ema.end(),
+              [](double value) {
+                return !std::isfinite(value) || value <= 0.0;
+              }) ||
+          std::any_of(
+              saved.route_interval_ema.begin(),
+              saved.route_interval_ema.end(),
+              [](double value) {
+                return !std::isfinite(value) || value <= 0.0;
+              }) ||
+          std::any_of(
+              saved.last_seen.begin(),
+              saved.last_seen.end(),
+              [&saved](int64_t value) {
+                return value < -1 || value > saved.clock;
+              }) ||
+          std::any_of(
+              saved.route_last_seen.begin(),
+              saved.route_last_seen.end(),
+              [&saved](int64_t value) {
+                return value < -1 || value > saved.call_index;
+              })) {
+        throw std::invalid_argument(
+            "ExpertSSD global-pool policy values are invalid");
+      }
+      ExpertSSDMarkovState markov_probe(expert_count_, markov_history_);
+      markov_probe.restore(saved.markov);
+      output.layers.push_back(std::move(saved));
+    }
+    const auto key_count = layers_.size() * expert_count_;
+    output.retention = read_policy_vector<double>(
+        payload, offset, key_count);
+    output.last_access = read_policy_vector<uint64_t>(
+        payload, offset, key_count);
+    if (offset != payload.size() ||
+        std::any_of(
+            output.retention.begin(),
+            output.retention.end(),
+            [](double value) {
+              return !std::isfinite(value) || value < 0.0;
+            }) ||
+        std::any_of(
+            output.last_access.begin(),
+            output.last_access.end(),
+            [&output](uint64_t value) { return value > output.serial; })) {
+      throw std::invalid_argument(
+          "ExpertSSD global-pool policy tail is invalid");
+    }
+    return output;
+  }
+
   struct LayerState {
     int64_t layer{-1};
     size_t capacity{0};
@@ -1435,6 +1663,7 @@ class ExpertSSDGlobalPoolState {
   double age_weight_;
   double deadline_weight_;
   double markov_boost_;
+  size_t markov_history_;
   double miss_pressure_alpha_;
   double miss_pressure_weight_;
   std::vector<LayerState> layers_;
@@ -2310,6 +2539,48 @@ void init_ops(nb::module_& m) {
       "markov_payload"_a,
       nb::sig(
           "def _expert_ssd_global_pool_restore_layer_policy(state: _ExpertSSDGlobalPoolState, layer: int, clock: int, demand_scale: float, demand: list[float], last_seen: list[int], interval_ema: list[float], markov_payload: bytes) -> None"));
+  m.def(
+      "_expert_ssd_global_pool_policy_snapshot",
+      [](std::shared_ptr<ExpertSSDGlobalPoolState> state) {
+        if (!state) {
+          throw std::invalid_argument(
+              "ExpertSSD global-pool state is required");
+        }
+        const auto payload = state->serialize_policy();
+        return nb::bytes(payload.data(), payload.size());
+      },
+      "state"_a,
+      nb::sig(
+          "def _expert_ssd_global_pool_policy_snapshot(state: _ExpertSSDGlobalPoolState) -> bytes"));
+  m.def(
+      "_expert_ssd_global_pool_policy_validate",
+      [](std::shared_ptr<ExpertSSDGlobalPoolState> state, nb::bytes encoded) {
+        if (!state) {
+          throw std::invalid_argument(
+              "ExpertSSD global-pool state is required");
+        }
+        const std::string payload(encoded.c_str(), encoded.size());
+        state->validate_policy_snapshot(payload);
+      },
+      "state"_a,
+      "payload"_a,
+      nb::sig(
+          "def _expert_ssd_global_pool_policy_validate(state: _ExpertSSDGlobalPoolState, payload: bytes) -> None"));
+  m.def(
+      "_expert_ssd_global_pool_policy_restore",
+      [](std::shared_ptr<ExpertSSDGlobalPoolState> state, nb::bytes encoded) {
+        if (!state) {
+          throw std::invalid_argument(
+              "ExpertSSD global-pool state is required");
+        }
+        const std::string payload(encoded.c_str(), encoded.size());
+        nb::gil_scoped_release release;
+        state->restore_policy_snapshot(payload);
+      },
+      "state"_a,
+      "payload"_a,
+      nb::sig(
+          "def _expert_ssd_global_pool_policy_restore(state: _ExpertSSDGlobalPoolState, payload: bytes) -> None"));
   m.def(
       "_expert_ssd_global_pool_metadata",
       [](std::shared_ptr<ExpertSSDGlobalPoolState> state) {
