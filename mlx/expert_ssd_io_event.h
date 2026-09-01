@@ -123,6 +123,16 @@ MLX_API array expert_ssd_scalex_mxfp4_qmv(
     uint32_t projection,
     StreamOrDevice s = {});
 
+// Fixed GLM width-two/top-eight Up+Gate companion. The two token rows and
+// both projections retain independent width-one QMV reductions in one launch.
+MLX_API std::vector<array> expert_ssd_scalex_mxfp4_width2_pair_qmv(
+    const array& x,
+    const array& up_weight,
+    const array& gate_weight,
+    const array& scale_records,
+    const array& routes,
+    StreamOrDevice s = {});
+
 // Bank-transparent peer of the fixed ScaleX QMV. Each route selects either
 // the layer-private bank or the model-wide shared bank without splitting the
 // MLX graph. bank_routes contains zero for private and one for shared.
@@ -161,7 +171,7 @@ MLX_API array expert_ssd_scalex_mxfp4_qmv_split_routes_two_bank(
     uint32_t projection,
     StreamOrDevice s = {});
 
-// Fixed width-two/top-six ScaleX Down QMV with exact BF16 route-score
+// Fixed width-two/top-six-or-eight ScaleX Down QMV with exact BF16 route-score
 // reduction and shared-expert addition in the same Metal dispatch.
 MLX_API array expert_ssd_scalex_mxfp4_width2_down_reduce(
     const array& x,
