@@ -541,6 +541,56 @@ METAL_FUNC void dsv4_scalex_qmv_fast_impl(
       simd_lid);
 }
 
+[[kernel]] void dsv4_scalex_mxfp4_grouped_qmv_bf16(
+    const device uint32_t* weight [[buffer(0)]],
+    const device uint8_t* scale_records [[buffer(1)]],
+    const device bfloat16_t* x [[buffer(2)]],
+    const device uint32_t* routes [[buffer(3)]],
+    device bfloat16_t* output [[buffer(4)]],
+    const constant int& in_vec_size [[buffer(5)]],
+    const constant int& out_vec_size [[buffer(6)]],
+    const constant int& record_stride [[buffer(7)]],
+    const constant uint& projection [[buffer(8)]],
+    const constant uint& top_k [[buffer(9)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  threadgroup uint8_t scale_tile[1024];
+  const uint route_position = tid.z;
+  const uint slot = routes[route_position];
+  if (slot == 0xffffffffu) {
+    if (simd_lid < 4u) {
+      const uint row = tid.y * 8u + simd_gid * 4u + simd_lid;
+      if (row < uint(out_vec_size)) {
+        output[ulong(route_position) * ulong(out_vec_size) + row] =
+            bfloat16_t(0.0f);
+      }
+    }
+    return;
+  }
+  const ulong weight_stride =
+      ulong(out_vec_size) * ulong(in_vec_size / 8);
+  const uint scale_count = uint(out_vec_size * (in_vec_size / 32));
+  const device uint8_t* record =
+      scale_records + ulong(slot) * ulong(record_stride);
+  const uint input_position = route_position / top_k;
+  const device bfloat16_t* route_x =
+      x + ulong(input_position) * ulong(in_vec_size);
+  const uint3 qmv_tid(0u, tid.y, 0u);
+  dsv4_scalex_qmv_fast_impl<bfloat16_t, 32, 4>(
+      weight + ulong(slot) * weight_stride,
+      record,
+      scale_tile + simd_gid * 512u,
+      projection * scale_count,
+      route_x,
+      output + ulong(route_position) * ulong(out_vec_size),
+      in_vec_size,
+      out_vec_size,
+      qmv_tid,
+      simd_gid,
+      simd_lid);
+}
+
 // One logical QMV over two physical slot banks. Bank selection is uniform for
 // every threadgroup because tid.z names one routed expert, so this preserves
 // the single-bank dispatch topology without route partitioning.

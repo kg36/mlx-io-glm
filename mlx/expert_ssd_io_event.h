@@ -123,6 +123,19 @@ MLX_API array expert_ssd_scalex_mxfp4_qmv(
     uint32_t projection,
     StreamOrDevice s = {});
 
+// Wide-prompt peer for Gate/Up. ``x`` contains one row per token while
+// ``routes`` contains ``top_k`` physical expert rows per token. This keeps
+// compressed ScaleX records resident during prefill instead of hydrating a
+// second 256-row bank solely for gather_qmm.
+MLX_API array expert_ssd_scalex_mxfp4_grouped_qmv(
+    const array& x,
+    const array& weight,
+    const array& scale_records,
+    const array& routes,
+    uint32_t projection,
+    uint32_t top_k,
+    StreamOrDevice s = {});
+
 // Bank-transparent peer of the fixed ScaleX QMV. Each route selects either
 // the layer-private bank or the model-wide shared bank without splitting the
 // MLX graph. bank_routes contains zero for private and one for shared.

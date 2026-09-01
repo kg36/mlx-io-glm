@@ -863,6 +863,10 @@ class ExpertSSDGlobalPoolState {
   ExpertSSDGlobalPoolPlan plan(
       int64_t layer, const mx::array& indices,
       const std::vector<uint8_t>& active_mask = {}) {
+    if (shared_lease_active_) {
+      throw std::invalid_argument(
+          "ExpertSSD global-pool cannot plan while shared rows are leased");
+    }
     auto& state = layer_state(layer);
     ExpertSSDGlobalPoolPlan output;
     flatten(indices, output.routed);
@@ -1039,6 +1043,10 @@ class ExpertSSDGlobalPoolState {
   void replay_all_hit_route(
       int64_t layer,
       const std::vector<int64_t>& routed) {
+    if (shared_lease_active_) {
+      throw std::invalid_argument(
+          "ExpertSSD global-pool cannot replay while shared rows are leased");
+    }
     if (routed.empty()) {
       throw std::invalid_argument(
           "ExpertSSD global-pool all-hit route cannot be empty");
@@ -1201,6 +1209,86 @@ class ExpertSSDGlobalPoolState {
     }
   }
 
+  void lease_shared_rows() {
+    if (shared_lease_active_) {
+      throw std::invalid_argument(
+          "ExpertSSD global-pool shared rows are already leased");
+    }
+    for (auto& row : shared_rows_) {
+      row = -1;
+    }
+    shared_free_rows_.clear();
+    for (size_t row = shared_capacity_; row > 0; --row) {
+      shared_free_rows_.push_back(static_cast<int32_t>(row - 1));
+    }
+    shared_lease_active_ = true;
+  }
+
+  void restore_leased_shared_rows(
+      const std::vector<std::vector<int64_t>>& shared_assignments) {
+    if (!shared_lease_active_) {
+      throw std::invalid_argument(
+          "ExpertSSD global-pool shared rows are not leased");
+    }
+    if (std::any_of(
+            shared_rows_.begin(),
+            shared_rows_.end(),
+            [](int32_t row) { return row >= 0; })) {
+      throw std::invalid_argument(
+          "ExpertSSD global-pool leased shared rows are not empty");
+    }
+
+    std::vector<uint8_t> rows_used(shared_capacity_, 0);
+    std::vector<uint8_t> experts_used(layers_.size() * expert_count_, 0);
+    std::vector<std::tuple<size_t, int64_t, int32_t>> parsed;
+    parsed.reserve(shared_assignments.size());
+    for (const auto& assignment : shared_assignments) {
+      if (assignment.size() != 3) {
+        throw std::invalid_argument(
+            "ExpertSSD leased shared assignment must be [layer, expert, row]");
+      }
+      const auto layer_iterator = layer_lookup_.find(assignment[0]);
+      if (layer_iterator == layer_lookup_.end()) {
+        throw std::invalid_argument(
+            "ExpertSSD leased shared restore layer is unmanaged");
+      }
+      const auto layer_index = layer_iterator->second;
+      const auto expert = assignment[1];
+      validate_expert(expert);
+      const auto row = assignment[2];
+      if (row < 0 || static_cast<size_t>(row) >= shared_capacity_) {
+        throw std::invalid_argument(
+            "ExpertSSD leased shared restore row is invalid");
+      }
+      if (rows_used[row]) {
+        throw std::invalid_argument(
+            "ExpertSSD leased shared restore duplicates a row");
+      }
+      const auto resident_key = key(layer_index, expert);
+      if (experts_used[resident_key]) {
+        throw std::invalid_argument(
+            "ExpertSSD leased shared restore duplicates an expert");
+      }
+      if (layers_[layer_index].expert_to_row[expert] >= 0) {
+        throw std::invalid_argument(
+            "ExpertSSD leased shared restore duplicates a private expert");
+      }
+      rows_used[row] = 1;
+      experts_used[resident_key] = 1;
+      parsed.emplace_back(layer_index, expert, static_cast<int32_t>(row));
+    }
+    for (const auto& [layer_index, expert, row] : parsed) {
+      shared_rows_[key(layer_index, expert)] = row;
+    }
+    shared_free_rows_.clear();
+    for (size_t row = shared_capacity_; row > 0; --row) {
+      if (!rows_used[row - 1]) {
+        shared_free_rows_.push_back(static_cast<int32_t>(row - 1));
+      }
+    }
+    shared_lease_active_ = false;
+  }
+
   void restore_layer_policy(
       int64_t layer,
       int64_t clock,
@@ -1344,6 +1432,7 @@ class ExpertSSDGlobalPoolState {
     output["evictions"] = evictions_;
     output["private_evictions"] = private_evictions_;
     output["shared_evictions"] = shared_evictions_;
+    output["shared_lease_active"] = shared_lease_active_;
     return output;
   }
 
@@ -1812,6 +1901,7 @@ class ExpertSSDGlobalPoolState {
   size_t evictions_{0};
   size_t private_evictions_{0};
   size_t shared_evictions_{0};
+  bool shared_lease_active_{false};
 };
 
 mx::Dtype scalar_to_dtype(Scalar s) {
@@ -2158,7 +2248,8 @@ struct ScaleXAsyncBatchState {
       size_t worker_count,
       bool interactive_qos,
       std::shared_ptr<mx::ExpertSSDIoEventState> event_state,
-      uint64_t event_value)
+      uint64_t event_value,
+      uint64_t wait_value = 0)
       : direct(std::move(direct)),
         expert_ids(std::move(expert_ids)),
         gate_up_slots(std::move(gate_up_slots)),
@@ -2170,7 +2261,8 @@ struct ScaleXAsyncBatchState {
         worker_count(worker_count),
         interactive_qos(interactive_qos),
         event_state(std::move(event_state)),
-        event_value(event_value) {}
+        event_value(event_value),
+        wait_value(wait_value) {}
 
   std::shared_ptr<mx::ScaleXModeADirect> direct;
   std::vector<size_t> expert_ids;
@@ -2191,6 +2283,7 @@ struct ScaleXAsyncBatchState {
   bool interactive_qos{false};
   std::shared_ptr<mx::ExpertSSDIoEventState> event_state;
   uint64_t event_value{0};
+  uint64_t wait_value{0};
   std::atomic<size_t> next{0};
   std::mutex error_mutex;
   std::exception_ptr error;
@@ -2369,6 +2462,9 @@ void scalex_async_batch_run(void* raw) {
   std::unique_ptr<std::shared_ptr<ScaleXAsyncBatchState>> owner(
       static_cast<std::shared_ptr<ScaleXAsyncBatchState>*>(raw));
   auto state = *owner;
+  if (state->wait_value != 0) {
+    mx::expert_ssd_io_event_wait(state->event_state, state->wait_value);
+  }
   const auto queue = dispatch_get_global_queue(
       state->interactive_qos ? QOS_CLASS_USER_INTERACTIVE
                              : QOS_CLASS_USER_INITIATED,
@@ -3023,6 +3119,34 @@ void init_ops(nb::module_& m) {
       nb::sig(
           "def _expert_ssd_global_pool_restore_rows(state: _ExpertSSDGlobalPoolState, private_assignments: list[list[int]], shared_assignments: list[list[int]]) -> None"));
   m.def(
+      "_expert_ssd_global_pool_lease_shared_rows",
+      [](std::shared_ptr<ExpertSSDGlobalPoolState> state) {
+        if (!state) {
+          throw std::invalid_argument(
+              "ExpertSSD global-pool state is required");
+        }
+        nb::gil_scoped_release release;
+        state->lease_shared_rows();
+      },
+      "state"_a,
+      nb::sig(
+          "def _expert_ssd_global_pool_lease_shared_rows(state: _ExpertSSDGlobalPoolState) -> None"));
+  m.def(
+      "_expert_ssd_global_pool_restore_leased_shared_rows",
+      [](std::shared_ptr<ExpertSSDGlobalPoolState> state,
+         const std::vector<std::vector<int64_t>>& shared_assignments) {
+        if (!state) {
+          throw std::invalid_argument(
+              "ExpertSSD global-pool state is required");
+        }
+        nb::gil_scoped_release release;
+        state->restore_leased_shared_rows(shared_assignments);
+      },
+      "state"_a,
+      "shared_assignments"_a,
+      nb::sig(
+          "def _expert_ssd_global_pool_restore_leased_shared_rows(state: _ExpertSSDGlobalPoolState, shared_assignments: list[list[int]]) -> None"));
+  m.def(
       "_expert_ssd_global_pool_restore_layer_policy",
       [](std::shared_ptr<ExpertSSDGlobalPoolState> state,
          int64_t layer,
@@ -3286,6 +3410,25 @@ void init_ops(nb::module_& m) {
       "projection"_a,
       nb::sig(
           "def _expert_ssd_scalex_mxfp4_qmv(x: array, weight: array, scale_records: array, routes: array, projection: int) -> array"));
+  m.def(
+      "_expert_ssd_scalex_mxfp4_grouped_qmv",
+      [](const mx::array& x,
+         const mx::array& weight,
+         const mx::array& scale_records,
+         const mx::array& routes,
+         uint32_t projection,
+         uint32_t top_k) {
+        return mx::expert_ssd_scalex_mxfp4_grouped_qmv(
+            x, weight, scale_records, routes, projection, top_k);
+      },
+      "x"_a,
+      "weight"_a,
+      "scale_records"_a,
+      "routes"_a,
+      "projection"_a,
+      "top_k"_a,
+      nb::sig(
+          "def _expert_ssd_scalex_mxfp4_grouped_qmv(x: array, weight: array, scale_records: array, routes: array, projection: int, top_k: int) -> array"));
   m.def(
       "_expert_ssd_scalex_mxfp4_qmv_two_bank",
       [](const mx::array& x,
@@ -4440,8 +4583,10 @@ void init_ops(nb::module_& m) {
          bool interactive_qos,
          std::shared_ptr<mx::ExpertSSDIoEventState> event_state,
          uint64_t event_value,
-         bool trace_enabled) {
+         bool trace_enabled,
+         uint64_t wait_value) {
         if (!direct || !event_state || event_value == 0 ||
+            wait_value >= event_value ||
             expert_ids.empty() || expert_ids.size() != gate_up_slots.size() ||
             expert_ids.size() != down_slots.size() ||
             weight_row_nbytes.size() != 3 || worker_count == 0 ||
@@ -4508,7 +4653,8 @@ void init_ops(nb::module_& m) {
             worker_count,
             interactive_qos,
             std::move(event_state),
-            event_value);
+            event_value,
+            wait_value);
         state->record_row_nbytes = record_row_nbytes;
         if (trace_enabled) state->read_trace.resize(
             state->expert_ids.size() * (state->direct->replica_count() == 2 ? 2 : 1));
@@ -4542,9 +4688,10 @@ void init_ops(nb::module_& m) {
       "interactive_qos"_a,
       "event_state"_a,
       "event_value"_a,
+      "trace_enabled"_a = false,
+      "wait_value"_a = 0,
       nb::sig(
-          "def _scalex_mode_b_load_full_split_async(direct: _ScaleXModeADirect, expert_ids: list[int], gate_up_slots: list[int], down_slots: list[int], record_destinations: array, gate_destinations: array, down_destinations: array, up_destinations: array, weight_row_nbytes: list[int], worker_count: int, interactive_qos: bool, event_state: _ExpertSSDIoEventState, event_value: int, trace_enabled: bool = False) -> _ScaleXAsyncBatchState"),
-      "trace_enabled"_a = false);
+          "def _scalex_mode_b_load_full_split_async(direct: _ScaleXModeADirect, expert_ids: list[int], gate_up_slots: list[int], down_slots: list[int], record_destinations: array, gate_destinations: array, down_destinations: array, up_destinations: array, weight_row_nbytes: list[int], worker_count: int, interactive_qos: bool, event_state: _ExpertSSDIoEventState, event_value: int, trace_enabled: bool = False, wait_value: int = 0) -> _ScaleXAsyncBatchState"));
   m.def(
       "_scalex_mode_b_async_wait",
       [](const std::shared_ptr<ScaleXAsyncBatchState>& state) {

@@ -602,6 +602,60 @@ class ExpertSSDScaleXMXFP4QMV : public Primitive {
   uint32_t projection_;
 };
 
+class ExpertSSDScaleXMXFP4GroupedQMV : public Primitive {
+ public:
+  ExpertSSDScaleXMXFP4GroupedQMV(
+      Stream stream,
+      uint32_t projection,
+      uint32_t top_k)
+      : Primitive(stream), projection_(projection), top_k_(top_k) {}
+
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+    throw std::runtime_error(
+        "[ExpertSSDScaleXMXFP4GroupedQMV] CPU evaluation not supported");
+  }
+
+  void eval_gpu(
+      const std::vector<array>& inputs,
+      std::vector<array>& outputs) override {
+    if (inputs.size() != 4 || outputs.size() != 1) {
+      throw std::runtime_error(
+          "[ExpertSSDScaleXMXFP4GroupedQMV] invalid input/output arity");
+    }
+    auto& output = outputs[0];
+    output.set_data(allocator::malloc(output.nbytes()));
+    const auto& x = inputs[0];
+    const auto& weight = inputs[1];
+    const auto& scale_records = inputs[2];
+    const auto& routes = inputs[3];
+    const int K = x.shape(-1);
+    const int N = weight.shape(-2);
+    const int record_stride = scale_records.shape(-1);
+    auto& d = metal::device(stream().device);
+    auto* kernel = d.get_kernel("dsv4_scalex_mxfp4_grouped_qmv_bf16");
+    auto& encoder = metal::get_command_encoder(stream());
+    encoder.set_compute_pipeline_state(kernel);
+    encoder.set_input_array(weight, 0);
+    encoder.set_input_array(scale_records, 1);
+    encoder.set_input_array(x, 2);
+    encoder.set_input_array(routes, 3);
+    encoder.set_output_array(output, 4);
+    encoder.set_bytes(K, 5);
+    encoder.set_bytes(N, 6);
+    encoder.set_bytes(record_stride, 7);
+    encoder.set_bytes(projection_, 8);
+    encoder.set_bytes(top_k_, 9);
+    encoder.dispatch_threadgroups(
+        MTL::Size(1, N / 8, routes.size()), MTL::Size(32, 2, 1));
+  }
+
+  DEFINE_NAME(ExpertSSDScaleXMXFP4GroupedQMV)
+
+ private:
+  uint32_t projection_;
+  uint32_t top_k_;
+};
+
 class ExpertSSDScaleXMXFP4QMVTwoBank : public Primitive {
  public:
   ExpertSSDScaleXMXFP4QMVTwoBank(Stream stream, uint32_t projection)
@@ -1623,6 +1677,46 @@ array expert_ssd_scalex_mxfp4_qmv(
   Shape output_shape{static_cast<ShapeElem>(routes.size()), 1, N};
   auto primitive = std::make_shared<ExpertSSDScaleXMXFP4QMV>(
       to_stream(s, Device::gpu), projection);
+  return array::make_arrays(
+      {output_shape},
+      {bfloat16},
+      primitive,
+      {x, weight, scale_records, routes})[0];
+}
+
+array expert_ssd_scalex_mxfp4_grouped_qmv(
+    const array& x,
+    const array& weight,
+    const array& scale_records,
+    const array& routes,
+    uint32_t projection,
+    uint32_t top_k,
+    StreamOrDevice s) {
+  if (x.dtype() != bfloat16 || weight.dtype() != uint32 ||
+      scale_records.dtype() != uint8 ||
+      (routes.dtype() != uint32 && routes.dtype() != int32) ||
+      (projection != 0 && projection != 2) || top_k == 0) {
+    throw std::invalid_argument(
+        "[expert_ssd_scalex_mxfp4_grouped_qmv] incompatible dtype or projection");
+  }
+  const auto input_rows = x.size() / x.shape(-1);
+  if (x.ndim() < 2 || x.size() % x.shape(-1) != 0 ||
+      routes.ndim() != 1 || routes.size() == 0 ||
+      routes.size() != input_rows * top_k || weight.ndim() != 3 ||
+      scale_records.ndim() != 2 ||
+      weight.shape(0) != scale_records.shape(0)) {
+    throw std::invalid_argument(
+        "[expert_ssd_scalex_mxfp4_grouped_qmv] invalid wide-prompt geometry");
+  }
+  const int K = x.shape(-1);
+  const int N = weight.shape(-2);
+  if (K != 4096 || N != 2048 || weight.shape(-1) * 8 != K) {
+    throw std::invalid_argument(
+        "[expert_ssd_scalex_mxfp4_grouped_qmv] unsupported target geometry");
+  }
+  Shape output_shape{static_cast<ShapeElem>(routes.size()), 1, N};
+  auto primitive = std::make_shared<ExpertSSDScaleXMXFP4GroupedQMV>(
+      to_stream(s, Device::gpu), projection, top_k);
   return array::make_arrays(
       {output_shape},
       {bfloat16},
