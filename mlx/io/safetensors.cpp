@@ -611,7 +611,25 @@ ScaleXModeADirect::ScaleXModeADirect(
     bool read_ahead,
     std::shared_ptr<ScaleXPrefixStore> prefix_store,
     size_t prefix_layer)
-    : file_(std::move(file)),
+    : ScaleXModeADirect(
+          std::vector<std::string>{std::move(file)},
+          std::move(records),
+          decoded_tensor_nbytes,
+          no_cache,
+          read_ahead,
+          std::move(prefix_store),
+          prefix_layer) {}
+
+ScaleXModeADirect::ScaleXModeADirect(
+    std::vector<std::string> files,
+    std::vector<ScaleXModeARecordSpec> records,
+    std::array<size_t, 3> decoded_tensor_nbytes,
+    bool no_cache,
+    bool read_ahead,
+    std::shared_ptr<ScaleXPrefixStore> prefix_store,
+    size_t prefix_layer)
+    : file_(files.empty() ? std::string{} : std::move(files.front())),
+      replica_file_(files.size() == 2 ? std::move(files[1]) : std::string{}),
       records_(std::move(records)),
       decoded_tensor_nbytes_(decoded_tensor_nbytes),
       prefix_store_(std::move(prefix_store)),
@@ -620,21 +638,40 @@ ScaleXModeADirect::ScaleXModeADirect(
   throw std::runtime_error(
       "[ScaleXModeADirect] decode-on-arrival requires POSIX pread");
 #else
-  if (records_.empty() ||
+  if ((files.size() != 1 && files.size() != 2) || file_.empty() ||
+      (files.size() == 2 && replica_file_.empty()) || records_.empty() ||
       std::any_of(
           decoded_tensor_nbytes_.begin(),
           decoded_tensor_nbytes_.end(),
           [](size_t value) { return value == 0; })) {
     throw std::invalid_argument(
-        "[ScaleXModeADirect] records and decoded tensor sizes must be non-empty");
+        "[ScaleXModeADirect] one or two files, records, and decoded tensor "
+        "sizes are required");
   }
   fd_ = ::open(file_.c_str(), O_RDONLY);
   if (fd_ < 0) {
     throw std::runtime_error("[ScaleXModeADirect] failed to open file " + file_);
   }
+  if (!replica_file_.empty()) {
+    replica_fd_ = ::open(replica_file_.c_str(), O_RDONLY);
+    if (replica_fd_ < 0) {
+      ::close(fd_);
+      fd_ = -1;
+      throw std::runtime_error(
+          "[ScaleXModeADirect] failed to open replica " + replica_file_);
+    }
+  }
 #ifdef __APPLE__
-  if ((no_cache && ::fcntl(fd_, F_NOCACHE, 1) != 0) ||
-      (!read_ahead && ::fcntl(fd_, F_RDAHEAD, 0) != 0)) {
+  const auto apply_cache_policy = [&](int file_fd) {
+    return (!no_cache || ::fcntl(file_fd, F_NOCACHE, 1) == 0) &&
+        (read_ahead || ::fcntl(file_fd, F_RDAHEAD, 0) == 0);
+  };
+  if (!apply_cache_policy(fd_) ||
+      (replica_fd_ >= 0 && !apply_cache_policy(replica_fd_))) {
+    if (replica_fd_ >= 0) {
+      ::close(replica_fd_);
+      replica_fd_ = -1;
+    }
     ::close(fd_);
     fd_ = -1;
     throw std::runtime_error(
@@ -642,6 +679,10 @@ ScaleXModeADirect::ScaleXModeADirect(
   }
 #else
   if (no_cache || !read_ahead) {
+    if (replica_fd_ >= 0) {
+      ::close(replica_fd_);
+      replica_fd_ = -1;
+    }
     ::close(fd_);
     fd_ = -1;
     throw std::runtime_error(
@@ -650,14 +691,43 @@ ScaleXModeADirect::ScaleXModeADirect(
 #endif
   struct stat info {};
   if (::fstat(fd_, &info) != 0 || info.st_size < 0) {
+    if (replica_fd_ >= 0) {
+      ::close(replica_fd_);
+      replica_fd_ = -1;
+    }
     ::close(fd_);
     fd_ = -1;
     throw std::runtime_error("[ScaleXModeADirect] failed to stat file " + file_);
   }
   file_nbytes_ = static_cast<size_t>(info.st_size);
+  if (replica_fd_ >= 0) {
+    struct stat replica_info {};
+    if (::fstat(replica_fd_, &replica_info) != 0 ||
+        replica_info.st_size < 0) {
+      ::close(replica_fd_);
+      replica_fd_ = -1;
+      ::close(fd_);
+      fd_ = -1;
+      throw std::runtime_error(
+          "[ScaleXModeADirect] failed to stat replica " + replica_file_);
+    }
+    replica_file_nbytes_ = static_cast<size_t>(replica_info.st_size);
+    if (replica_file_nbytes_ != file_nbytes_) {
+      ::close(replica_fd_);
+      replica_fd_ = -1;
+      ::close(fd_);
+      fd_ = -1;
+      throw std::invalid_argument(
+          "[ScaleXModeADirect] replica size differs from primary file");
+    }
+  }
   for (const auto& record : records_) {
     if (record.encoded_nbytes < 24 || record.absolute_offset > file_nbytes_ ||
         record.encoded_nbytes > file_nbytes_ - record.absolute_offset) {
+      if (replica_fd_ >= 0) {
+        ::close(replica_fd_);
+        replica_fd_ = -1;
+      }
       ::close(fd_);
       fd_ = -1;
       throw std::invalid_argument(
@@ -674,6 +744,10 @@ ScaleXModeADirect::ScaleXModeADirect(
       0);
   if (file_mapping_ == MAP_FAILED) {
     file_mapping_ = nullptr;
+    if (replica_fd_ >= 0) {
+      ::close(replica_fd_);
+      replica_fd_ = -1;
+    }
     ::close(fd_);
     fd_ = -1;
     throw std::runtime_error(
@@ -694,6 +768,10 @@ ScaleXModeADirect::ScaleXModeADirect(
       ::munmap(file_mapping_, file_nbytes_);
       file_mapping_ = nullptr;
 #endif
+      if (replica_fd_ >= 0) {
+        ::close(replica_fd_);
+        replica_fd_ = -1;
+      }
       ::close(fd_);
       fd_ = -1;
       throw std::invalid_argument(
@@ -713,6 +791,9 @@ ScaleXModeADirect::~ScaleXModeADirect() {
 #endif
   if (fd_ >= 0) {
     ::close(fd_);
+  }
+  if (replica_fd_ >= 0) {
+    ::close(replica_fd_);
   }
 #endif
 }
@@ -837,9 +918,74 @@ void ScaleXModeADirect::load_compressed_expert_into(
   throw std::runtime_error(
       "[ScaleXModeADirect] compressed expert reads require POSIX preadv");
 #else
+  const size_t total_bytes =
+      compressed_expert_nbytes(expert_id, weight_destination_nbytes);
+  load_compressed_expert_slice_into_from(
+      0,
+      expert_id,
+      0,
+      total_bytes,
+      record_destination,
+      record_destination_nbytes,
+      weight_destinations,
+      weight_destination_nbytes);
+  finalize_compressed_expert(
+      expert_id, record_destination, record_destination_nbytes);
+#endif
+}
+
+size_t ScaleXModeADirect::compressed_expert_nbytes(
+    size_t expert_id,
+    const std::array<size_t, 3>& weight_destination_nbytes) const {
   if (expert_id >= records_.size()) {
     throw std::out_of_range("[ScaleXModeADirect] expert id is out of range");
   }
+  if (std::any_of(
+          weight_destination_nbytes.begin(),
+          weight_destination_nbytes.end(),
+          [](size_t value) { return value == 0; })) {
+    throw std::invalid_argument(
+        "[ScaleXModeADirect] compressed weight sizes must be non-zero");
+  }
+  const size_t weight_bytes = std::accumulate(
+      weight_destination_nbytes.begin(),
+      weight_destination_nbytes.end(),
+      size_t{0});
+  const auto& record = records_[expert_id];
+  if (weight_bytes > std::numeric_limits<size_t>::max() - record.encoded_nbytes) {
+    throw std::overflow_error(
+        "[ScaleXModeADirect] compressed expert byte size overflow");
+  }
+  const size_t total_bytes = record.encoded_nbytes + weight_bytes;
+  if (record.absolute_offset > file_nbytes_ ||
+      total_bytes > file_nbytes_ - record.absolute_offset ||
+      (replica_fd_ >= 0 &&
+       (record.absolute_offset > replica_file_nbytes_ ||
+        total_bytes > replica_file_nbytes_ - record.absolute_offset))) {
+    throw std::runtime_error(
+        "[ScaleXModeADirect] compressed expert range exceeds file bounds");
+  }
+  return total_bytes;
+}
+
+void ScaleXModeADirect::load_compressed_expert_slice_into_from(
+    size_t replica,
+    size_t expert_id,
+    size_t logical_begin,
+    size_t logical_end,
+    char* record_destination,
+    size_t record_destination_nbytes,
+    const std::array<char*, 3>& weight_destinations,
+    const std::array<size_t, 3>& weight_destination_nbytes) const {
+#ifdef _WIN32
+  throw std::runtime_error(
+      "[ScaleXModeADirect] compressed expert slices require POSIX preadv");
+#else
+  if (replica >= replica_count()) {
+    throw std::out_of_range("[ScaleXModeADirect] replica is out of range");
+  }
+  const size_t total_bytes =
+      compressed_expert_nbytes(expert_id, weight_destination_nbytes);
   const auto& record = records_[expert_id];
   const size_t raw_nbytes = std::accumulate(
       decoded_tensor_nbytes_.begin(), decoded_tensor_nbytes_.end(), size_t{0});
@@ -849,57 +995,84 @@ void ScaleXModeADirect::load_compressed_expert_into(
       std::any_of(
           weight_destinations.begin(), weight_destinations.end(), [](char* value) {
             return value == nullptr;
-          }) ||
-      std::any_of(
-          weight_destination_nbytes.begin(),
-          weight_destination_nbytes.end(),
-          [](size_t value) { return value == 0; })) {
+          })) {
     throw std::invalid_argument(
         "[ScaleXModeADirect] compressed destination tensor layout mismatch");
   }
-  const size_t weight_bytes = std::accumulate(
-      weight_destination_nbytes.begin(),
-      weight_destination_nbytes.end(),
-      size_t{0});
-  if (record.absolute_offset > file_nbytes_ ||
-      record.encoded_nbytes > file_nbytes_ - record.absolute_offset ||
-      weight_bytes >
-          file_nbytes_ - record.absolute_offset - record.encoded_nbytes) {
-    throw std::runtime_error(
-        "[ScaleXModeADirect] compressed expert range exceeds file bounds");
+  if (logical_begin > logical_end || logical_end > total_bytes) {
+    throw std::out_of_range(
+        "[ScaleXModeADirect] compressed expert slice is out of range");
+  }
+  if (logical_begin == logical_end) {
+    return;
   }
 
+  const std::array<char*, 4> bases{
+      record_destination,
+      weight_destinations[0],
+      weight_destinations[1],
+      weight_destinations[2]};
+  const std::array<size_t, 4> lengths{
+      record.encoded_nbytes,
+      weight_destination_nbytes[0],
+      weight_destination_nbytes[1],
+      weight_destination_nbytes[2]};
   std::array<struct iovec, 4> vectors{};
-  vectors[0].iov_base = record_destination;
-  vectors[0].iov_len = record.encoded_nbytes;
-  for (size_t tensor = 0; tensor < weight_destinations.size(); ++tensor) {
-    vectors[tensor + 1].iov_base = weight_destinations[tensor];
-    vectors[tensor + 1].iov_len = weight_destination_nbytes[tensor];
+  int vector_count = 0;
+  size_t segment_start = 0;
+  for (size_t segment = 0; segment < bases.size(); ++segment) {
+    const size_t segment_end = segment_start + lengths[segment];
+    const size_t begin = std::max(logical_begin, segment_start);
+    const size_t end = std::min(logical_end, segment_end);
+    if (begin < end) {
+      vectors[vector_count].iov_base =
+          bases[segment] + (begin - segment_start);
+      vectors[vector_count].iov_len = end - begin;
+      ++vector_count;
+    }
+    segment_start = segment_end;
   }
-  const size_t total_bytes = record.encoded_nbytes + weight_bytes;
+  const int source_fd = replica == 0 ? fd_ : replica_fd_;
+  const size_t requested = logical_end - logical_begin;
   ssize_t result;
   do {
     result = ::preadv(
-        fd_,
+        source_fd,
         vectors.data(),
-        static_cast<int>(vectors.size()),
-        static_cast<off_t>(record.absolute_offset));
+        vector_count,
+        static_cast<off_t>(record.absolute_offset + logical_begin));
   } while (result < 0 && errno == EINTR);
-  if (result != static_cast<ssize_t>(total_bytes)) {
-    pread_exact(
-        fd_,
-        record_destination,
-        record.encoded_nbytes,
-        record.absolute_offset);
-    size_t offset = record.absolute_offset + record.encoded_nbytes;
-    for (size_t tensor = 0; tensor < weight_destinations.size(); ++tensor) {
+  if (result != static_cast<ssize_t>(requested)) {
+    size_t file_offset = record.absolute_offset + logical_begin;
+    for (int index = 0; index < vector_count; ++index) {
       pread_exact(
-          fd_,
-          weight_destinations[tensor],
-          weight_destination_nbytes[tensor],
-          offset);
-      offset += weight_destination_nbytes[tensor];
+          source_fd,
+          static_cast<char*>(vectors[index].iov_base),
+          vectors[index].iov_len,
+          file_offset);
+      file_offset += vectors[index].iov_len;
     }
+  }
+  replica_reads_[replica].fetch_add(1, std::memory_order_relaxed);
+  replica_bytes_[replica].fetch_add(requested, std::memory_order_relaxed);
+#endif
+}
+
+void ScaleXModeADirect::finalize_compressed_expert(
+    size_t expert_id,
+    char* record_destination,
+    size_t record_destination_nbytes) const {
+  if (expert_id >= records_.size() || record_destination == nullptr) {
+    throw std::invalid_argument(
+        "[ScaleXModeADirect] invalid compressed expert finalization");
+  }
+  const auto& record = records_[expert_id];
+  const size_t raw_nbytes = std::accumulate(
+      decoded_tensor_nbytes_.begin(), decoded_tensor_nbytes_.end(), size_t{0});
+  if (record_destination_nbytes <
+      scalex_indexed_nbytes(record.encoded_nbytes, raw_nbytes)) {
+    throw std::invalid_argument(
+        "[ScaleXModeADirect] compressed record row is too small");
   }
   const auto prefix_started = std::chrono::steady_clock::now();
   if (prefix_store_) {
@@ -918,14 +1091,12 @@ void ScaleXModeADirect::load_compressed_expert_into(
         record_destination_nbytes,
         raw_nbytes);
   }
-  const auto prefix_elapsed = static_cast<uint64_t>(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(
-          std::chrono::steady_clock::now() - prefix_started)
-          .count());
   prefix_prepare_nanoseconds_.fetch_add(
-      prefix_elapsed, std::memory_order_relaxed);
+      static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - prefix_started)
+                                .count()),
+      std::memory_order_relaxed);
   prefix_prepare_calls_.fetch_add(1, std::memory_order_relaxed);
-#endif
 }
 
 size_t ScaleXModeADirect::load_compressed_expert_chunk_into(
@@ -1075,6 +1246,28 @@ ScaleXPrefixStats ScaleXModeADirect::prefix_stats() const {
       prefix_store_ ? prefix_store_->load_nanoseconds() : uint64_t{0}};
 }
 
+ScaleXReplicaStats ScaleXModeADirect::replica_stats() const {
+  ScaleXReplicaStats stats;
+  stats.replica_count = replica_count();
+  for (size_t replica = 0; replica < stats.replica_count; ++replica) {
+    stats.reads[replica] =
+        replica_reads_[replica].load(std::memory_order_relaxed);
+    stats.bytes[replica] =
+        replica_bytes_[replica].load(std::memory_order_relaxed);
+  }
+  return stats;
+}
+
+const std::string& ScaleXModeADirect::replica_file(size_t replica) const {
+  if (replica == 0) {
+    return file_;
+  }
+  if (replica == 1 && replica_fd_ >= 0) {
+    return replica_file_;
+  }
+  throw std::out_of_range("[ScaleXModeADirect] replica is out of range");
+}
+
 size_t ScaleXModeADirect::advise_read(
     size_t expert_id,
     size_t total_bytes) const {
@@ -1100,6 +1293,48 @@ size_t ScaleXModeADirect::advise_read(
         "[ScaleXModeADirect] macOS asynchronous read advice failed");
   }
   return total_bytes;
+#else
+  throw std::runtime_error(
+      "[ScaleXModeADirect] asynchronous read advice requires macOS");
+#endif
+}
+
+size_t ScaleXModeADirect::advise_read_slice_from(
+    size_t replica,
+    size_t expert_id,
+    size_t logical_begin,
+    size_t logical_end) const {
+  if (replica >= replica_count() || expert_id >= records_.size()) {
+    throw std::out_of_range(
+        "[ScaleXModeADirect] advisory replica or expert is out of range");
+  }
+  const auto& record = records_[expert_id];
+  const size_t file_nbytes = replica == 0 ? file_nbytes_ : replica_file_nbytes_;
+  if (logical_begin > logical_end ||
+      record.absolute_offset > file_nbytes ||
+      logical_end > file_nbytes - record.absolute_offset) {
+    throw std::out_of_range(
+        "[ScaleXModeADirect] advisory byte slice is invalid");
+  }
+  const size_t length = logical_end - logical_begin;
+  if (length == 0) {
+    return 0;
+  }
+#ifdef __APPLE__
+  if (length > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    throw std::overflow_error(
+        "[ScaleXModeADirect] advisory byte slice exceeds macOS limit");
+  }
+  const int source_fd = replica == 0 ? fd_ : replica_fd_;
+  struct radvisory advice {
+    static_cast<off_t>(record.absolute_offset + logical_begin),
+    static_cast<int>(length)
+  };
+  if (::fcntl(source_fd, F_RDADVISE, &advice) != 0) {
+    throw std::runtime_error(
+        "[ScaleXModeADirect] macOS striped read advice failed");
+  }
+  return length;
 #else
   throw std::runtime_error(
       "[ScaleXModeADirect] asynchronous read advice requires macOS");

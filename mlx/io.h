@@ -134,6 +134,12 @@ struct ScaleXPrefixStats {
   uint64_t store_load_nanoseconds{0};
 };
 
+struct ScaleXReplicaStats {
+  size_t replica_count{1};
+  std::array<uint64_t, 2> reads{};
+  std::array<uint64_t, 2> bytes{};
+};
+
 /**
  * Decode-on-arrival reader for the three E8M0 scale tensors of one expert.
  *
@@ -144,6 +150,14 @@ class MLX_API ScaleXModeADirect {
  public:
   ScaleXModeADirect(
       std::string file,
+      std::vector<ScaleXModeARecordSpec> records,
+      std::array<size_t, 3> decoded_tensor_nbytes,
+      bool no_cache = false,
+      bool read_ahead = true,
+      std::shared_ptr<ScaleXPrefixStore> prefix_store = nullptr,
+      size_t prefix_layer = 0);
+  ScaleXModeADirect(
+      std::vector<std::string> files,
       std::vector<ScaleXModeARecordSpec> records,
       std::array<size_t, 3> decoded_tensor_nbytes,
       bool no_cache = false,
@@ -190,6 +204,26 @@ class MLX_API ScaleXModeADirect {
       const std::array<char*, 3>& weight_destinations,
       const std::array<size_t, 3>& weight_destination_nbytes) const;
 
+  // Read one logical byte slice from a selected byte-identical replica. The
+  // caller coordinates all slices and installs the ScaleX prefix once the
+  // complete expert payload has landed.
+  void load_compressed_expert_slice_into_from(
+      size_t replica,
+      size_t expert_id,
+      size_t logical_begin,
+      size_t logical_end,
+      char* record_destination,
+      size_t record_destination_nbytes,
+      const std::array<char*, 3>& weight_destinations,
+      const std::array<size_t, 3>& weight_destination_nbytes) const;
+  void finalize_compressed_expert(
+      size_t expert_id,
+      char* record_destination,
+      size_t record_destination_nbytes) const;
+  size_t compressed_expert_nbytes(
+      size_t expert_id,
+      const std::array<size_t, 3>& weight_destination_nbytes) const;
+
   size_t num_experts() const {
     return records_.size();
   }
@@ -202,7 +236,17 @@ class MLX_API ScaleXModeADirect {
   // when available, otherwise built after the on-disk record lands.
   size_t maximum_indexed_nbytes() const;
   ScaleXPrefixStats prefix_stats() const;
+  ScaleXReplicaStats replica_stats() const;
+  size_t replica_count() const {
+    return replica_fd_ >= 0 ? 2 : 1;
+  }
+  const std::string& replica_file(size_t replica) const;
   size_t advise_read(size_t expert_id, size_t total_bytes) const;
+  size_t advise_read_slice_from(
+      size_t replica,
+      size_t expert_id,
+      size_t logical_begin,
+      size_t logical_end) const;
   std::pair<size_t, size_t> page_residency(
       size_t expert_id,
       size_t total_bytes) const;
@@ -222,12 +266,17 @@ class MLX_API ScaleXModeADirect {
   size_t file_nbytes_{0};
   int fd_{-1};
   void* file_mapping_{nullptr};
+  std::string replica_file_;
+  size_t replica_file_nbytes_{0};
+  int replica_fd_{-1};
   std::vector<ScaleXModeARecordSpec> records_;
   std::array<size_t, 3> decoded_tensor_nbytes_{};
   std::shared_ptr<ScaleXPrefixStore> prefix_store_;
   size_t prefix_layer_{0};
   mutable std::atomic<size_t> prefix_prepare_calls_{0};
   mutable std::atomic<uint64_t> prefix_prepare_nanoseconds_{0};
+  mutable std::array<std::atomic<uint64_t>, 2> replica_reads_{};
+  mutable std::array<std::atomic<uint64_t>, 2> replica_bytes_{};
 };
 
 /** Positioned row reader for a two-dimensional official safetensors tensor. */

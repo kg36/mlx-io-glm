@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cmath>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <exception>
@@ -1918,6 +1920,44 @@ nb::tuple official_direct_route_plan(mx::array indices) {
       "[_expert_ssd_route_plan] indices must be int32, int64, uint32, or uint64");
 }
 
+double expert_ssd_internal_to_replica_speed_ratio() {
+  static const double ratio = [] {
+    const char* raw =
+        std::getenv("MLX_EXPERT_SSD_INTERNAL_TO_REPLICA_SPEED_RATIO");
+    if (raw == nullptr || *raw == '\0') {
+      return 1.0;
+    }
+    char* end = nullptr;
+    errno = 0;
+    const double parsed = std::strtod(raw, &end);
+    if (errno != 0 || end == raw || *end != '\0' || !std::isfinite(parsed) ||
+        parsed <= 0.0) {
+      throw std::invalid_argument(
+          "MLX_EXPERT_SSD_INTERNAL_TO_REPLICA_SPEED_RATIO must be a "
+          "positive finite number");
+    }
+    return parsed;
+  }();
+  return ratio;
+}
+
+size_t expert_ssd_internal_stripe_bytes_for_ratio(
+    size_t total,
+    long double ratio) {
+  if (total < 2) {
+    return total;
+  }
+  const long double share = ratio / (ratio + 1.0L);
+  const size_t split = static_cast<size_t>(
+      std::llround(static_cast<long double>(total) * share));
+  return std::clamp(split, size_t{1}, total - 1);
+}
+
+size_t expert_ssd_internal_stripe_bytes(size_t total) {
+  return expert_ssd_internal_stripe_bytes_for_ratio(
+      total, expert_ssd_internal_to_replica_speed_ratio());
+}
+
 struct ScaleXAsyncBatchState {
   ScaleXAsyncBatchState(
       std::shared_ptr<mx::ScaleXModeADirect> direct,
@@ -1973,11 +2013,15 @@ struct ScaleXAsyncBatchState {
 
 void scalex_async_batch_worker(void* raw, size_t) {
   auto* state = static_cast<ScaleXAsyncBatchState*>(raw);
+  const bool striped = state->direct->replica_count() == 2;
+  const size_t task_count = state->expert_ids.size() * (striped ? 2 : 1);
   while (true) {
-    const size_t item = state->next.fetch_add(1);
-    if (item >= state->expert_ids.size()) {
+    const size_t task = state->next.fetch_add(1);
+    if (task >= task_count) {
       return;
     }
+    const size_t item = striped ? task / 2 : task;
+    const size_t replica = striped ? task % 2 : 0;
     try {
       const std::array<char*, 3> pointers{
           state->gate_base +
@@ -1985,13 +2029,31 @@ void scalex_async_batch_worker(void* raw, size_t) {
           state->down_base + state->down_slots[item] * state->row_nbytes[1],
           state->up_base +
               state->gate_up_slots[item] * state->row_nbytes[2]};
-      state->direct->load_compressed_expert_into(
-          state->expert_ids[item],
-          state->record_base +
-              state->gate_up_slots[item] * state->record_row_nbytes,
-          state->record_row_nbytes,
-          pointers,
-          state->row_nbytes);
+      char* record = state->record_base +
+          state->gate_up_slots[item] * state->record_row_nbytes;
+      if (striped) {
+        const size_t total = state->direct->compressed_expert_nbytes(
+            state->expert_ids[item], state->row_nbytes);
+        const size_t split = expert_ssd_internal_stripe_bytes(total);
+        const size_t begin = replica == 0 ? 0 : split;
+        const size_t end = replica == 0 ? split : total;
+        state->direct->load_compressed_expert_slice_into_from(
+            replica,
+            state->expert_ids[item],
+            begin,
+            end,
+            record,
+            state->record_row_nbytes,
+            pointers,
+            state->row_nbytes);
+      } else {
+        state->direct->load_compressed_expert_into(
+            state->expert_ids[item],
+            record,
+            state->record_row_nbytes,
+            pointers,
+            state->row_nbytes);
+      }
     } catch (...) {
       std::lock_guard<std::mutex> lock(state->error_mutex);
       if (!state->error) {
@@ -2011,10 +2073,36 @@ void scalex_async_batch_run(void* raw) {
                              : QOS_CLASS_USER_INITIATED,
       0);
   dispatch_apply_f(
-      std::min(state->worker_count, state->expert_ids.size()),
+      std::min(
+          state->worker_count,
+          state->expert_ids.size() *
+              (state->direct->replica_count() == 2 ? 2 : 1)),
       queue,
       state.get(),
       scalex_async_batch_worker);
+  if (state->direct->replica_count() == 2) {
+    try {
+      {
+        std::lock_guard<std::mutex> lock(state->error_mutex);
+        if (state->error) {
+          throw std::runtime_error(
+              "[ScaleXAsyncBatchState] striped refill failed");
+        }
+      }
+      for (size_t item = 0; item < state->expert_ids.size(); ++item) {
+        state->direct->finalize_compressed_expert(
+            state->expert_ids[item],
+            state->record_base +
+                state->gate_up_slots[item] * state->record_row_nbytes,
+            state->record_row_nbytes);
+      }
+    } catch (...) {
+      std::lock_guard<std::mutex> lock(state->error_mutex);
+      if (!state->error) {
+        state->error = std::current_exception();
+      }
+    }
+  }
   {
     std::lock_guard<std::mutex> lock(state->completion_mutex);
     state->complete = true;
@@ -2073,11 +2161,15 @@ struct ScaleXTwoBankAsyncBatchState {
 
 void scalex_two_bank_batch_worker(void* raw, size_t) {
   auto* state = static_cast<ScaleXTwoBankAsyncBatchState*>(raw);
+  const bool striped = state->direct->replica_count() == 2;
+  const size_t task_count = state->expert_ids.size() * (striped ? 2 : 1);
   while (true) {
-    const size_t item = state->next.fetch_add(1);
-    if (item >= state->expert_ids.size()) {
+    const size_t task = state->next.fetch_add(1);
+    if (task >= task_count) {
       return;
     }
+    const size_t item = striped ? task / 2 : task;
+    const size_t replica = striped ? task % 2 : 0;
     try {
       const auto& bases = state->shared_bank[item]
           ? state->shared_bases
@@ -2090,12 +2182,30 @@ void scalex_two_bank_batch_worker(void* raw, size_t) {
           bases[1] + row * state->row_nbytes[0],
           bases[2] + row * state->row_nbytes[1],
           bases[3] + row * state->row_nbytes[2]};
-      state->direct->load_compressed_expert_into(
-          state->expert_ids[item],
-          bases[0] + row * record_row_nbytes,
-          record_row_nbytes,
-          pointers,
-          state->row_nbytes);
+      char* record = bases[0] + row * record_row_nbytes;
+      if (striped) {
+        const size_t total = state->direct->compressed_expert_nbytes(
+            state->expert_ids[item], state->row_nbytes);
+        const size_t split = expert_ssd_internal_stripe_bytes(total);
+        const size_t begin = replica == 0 ? 0 : split;
+        const size_t end = replica == 0 ? split : total;
+        state->direct->load_compressed_expert_slice_into_from(
+            replica,
+            state->expert_ids[item],
+            begin,
+            end,
+            record,
+            record_row_nbytes,
+            pointers,
+            state->row_nbytes);
+      } else {
+        state->direct->load_compressed_expert_into(
+            state->expert_ids[item],
+            record,
+            record_row_nbytes,
+            pointers,
+            state->row_nbytes);
+      }
     } catch (...) {
       std::lock_guard<std::mutex> lock(state->error_mutex);
       if (!state->error) {
@@ -2115,10 +2225,41 @@ void scalex_two_bank_batch_run(void* raw) {
                              : QOS_CLASS_USER_INITIATED,
       0);
   dispatch_apply_f(
-      std::min(state->worker_count, state->expert_ids.size()),
+      std::min(
+          state->worker_count,
+          state->expert_ids.size() *
+              (state->direct->replica_count() == 2 ? 2 : 1)),
       queue,
       state.get(),
       scalex_two_bank_batch_worker);
+  if (state->direct->replica_count() == 2) {
+    try {
+      {
+        std::lock_guard<std::mutex> lock(state->error_mutex);
+        if (state->error) {
+          throw std::runtime_error(
+              "[ScaleXTwoBankAsyncBatchState] striped refill failed");
+        }
+      }
+      for (size_t item = 0; item < state->expert_ids.size(); ++item) {
+        const auto& bases = state->shared_bank[item]
+            ? state->shared_bases
+            : state->private_bases;
+        const size_t record_row_nbytes = state->shared_bank[item]
+            ? state->shared_record_row_nbytes
+            : state->private_record_row_nbytes;
+        state->direct->finalize_compressed_expert(
+            state->expert_ids[item],
+            bases[0] + state->rows[item] * record_row_nbytes,
+            record_row_nbytes);
+      }
+    } catch (...) {
+      std::lock_guard<std::mutex> lock(state->error_mutex);
+      if (!state->error) {
+        state->error = std::current_exception();
+      }
+    }
+  }
   {
     std::lock_guard<std::mutex> lock(state->completion_mutex);
     state->complete = true;
@@ -2139,6 +2280,18 @@ void init_ops(nb::module_& m) {
   nb::class_<ExpertSSDMarkovState>(m, "_ExpertSSDMarkovState");
   nb::class_<ExpertSSDRouteCacheState>(m, "_ExpertSSDRouteCacheState");
   nb::class_<ExpertSSDGlobalPoolState>(m, "_ExpertSSDGlobalPoolState");
+  m.def(
+      "_expert_ssd_internal_stripe_bytes",
+      [](size_t total, double ratio) {
+        if (!std::isfinite(ratio) || ratio <= 0.0) {
+          throw std::invalid_argument("ratio must be a positive finite number");
+        }
+        return expert_ssd_internal_stripe_bytes_for_ratio(total, ratio);
+      },
+      "total"_a,
+      "ratio"_a,
+      nb::sig(
+          "def _expert_ssd_internal_stripe_bytes(total: int, ratio: float) -> int"));
   m.def(
       "_expert_ssd_markov_state_new",
       [](size_t expert_count, size_t history_limit) {
@@ -3218,6 +3371,48 @@ void init_ops(nb::module_& m) {
       nb::sig(
           "def _open_scalex_mode_a_direct(file: Union[str, pathlib.Path], records: list[tuple[int, int]], decoded_tensor_nbytes: list[int], no_cache: bool = False, read_ahead: bool = True, prefix_store: Optional[_ScaleXPrefixStore] = None, prefix_layer: int = 0) -> _ScaleXModeADirect"));
   m.def(
+      "_open_scalex_mode_a_replicated_direct",
+      [](const std::vector<std::string>& files,
+         const std::vector<std::pair<size_t, size_t>>& raw_records,
+         const std::vector<size_t>& decoded_tensor_nbytes,
+         bool no_cache,
+         bool read_ahead,
+         std::shared_ptr<mx::ScaleXPrefixStore> prefix_store,
+         size_t prefix_layer) {
+        if (files.size() != 2 || raw_records.empty() ||
+            decoded_tensor_nbytes.size() != 3) {
+          throw std::invalid_argument(
+              "[_open_scalex_mode_a_replicated_direct] expected two files, "
+              "records, and three tensor sizes");
+        }
+        std::vector<mx::ScaleXModeARecordSpec> records;
+        records.reserve(raw_records.size());
+        for (const auto& [offset, length] : raw_records) {
+          records.push_back({offset, length});
+        }
+        std::array<size_t, 3> tensor_nbytes{
+            decoded_tensor_nbytes[0],
+            decoded_tensor_nbytes[1],
+            decoded_tensor_nbytes[2]};
+        return std::make_shared<mx::ScaleXModeADirect>(
+            files,
+            std::move(records),
+            tensor_nbytes,
+            no_cache,
+            read_ahead,
+            std::move(prefix_store),
+            prefix_layer);
+      },
+      "files"_a,
+      "records"_a,
+      "decoded_tensor_nbytes"_a,
+      "no_cache"_a = false,
+      "read_ahead"_a = true,
+      "prefix_store"_a = nullptr,
+      "prefix_layer"_a = 0,
+      nb::sig(
+          "def _open_scalex_mode_a_replicated_direct(files: list[str], records: list[tuple[int, int]], decoded_tensor_nbytes: list[int], no_cache: bool = False, read_ahead: bool = True, prefix_store: Optional[_ScaleXPrefixStore] = None, prefix_layer: int = 0) -> _ScaleXModeADirect"));
+  m.def(
       "_scalex_mode_a_prefix_stats",
       [](std::shared_ptr<mx::ScaleXModeADirect> direct) {
         if (!direct) {
@@ -3237,6 +3432,28 @@ void init_ops(nb::module_& m) {
       nb::sig(
           "def _scalex_mode_a_prefix_stats(direct: _ScaleXModeADirect) -> dict"));
   m.def(
+      "_scalex_mode_a_replica_stats",
+      [](std::shared_ptr<mx::ScaleXModeADirect> direct) {
+        if (!direct) {
+          throw std::invalid_argument(
+              "[_scalex_mode_a_replica_stats] invalid handle");
+        }
+        const auto stats = direct->replica_stats();
+        nb::dict result;
+        result["replica_count"] = stats.replica_count;
+        for (size_t replica = 0; replica < stats.replica_count; ++replica) {
+          const auto suffix = std::to_string(replica);
+          result[("replica_" + suffix + "_reads").c_str()] =
+              stats.reads[replica];
+          result[("replica_" + suffix + "_bytes").c_str()] =
+              stats.bytes[replica];
+        }
+        return result;
+      },
+      "direct"_a,
+      nb::sig(
+          "def _scalex_mode_a_replica_stats(direct: _ScaleXModeADirect) -> dict"));
+  m.def(
       "_scalex_mode_a_advise_read",
       [](std::shared_ptr<mx::ScaleXModeADirect> direct,
          size_t expert_id,
@@ -3246,6 +3463,12 @@ void init_ops(nb::module_& m) {
               "[_scalex_mode_a_advise_read] invalid handle");
         }
         nb::gil_scoped_release release;
+        if (direct->replica_count() == 2) {
+          const size_t split = expert_ssd_internal_stripe_bytes(total_bytes);
+          return direct->advise_read_slice_from(0, expert_id, 0, split) +
+              direct->advise_read_slice_from(
+                  1, expert_id, split, total_bytes);
+        }
         return direct->advise_read(expert_id, total_bytes);
       },
       "direct"_a,
@@ -3266,8 +3489,18 @@ void init_ops(nb::module_& m) {
         advised.reserve(expert_ids.size());
         nb::gil_scoped_release release;
         for (size_t index = 0; index < expert_ids.size(); ++index) {
-          advised.push_back(
-              direct->advise_read(expert_ids[index], total_bytes[index]));
+          if (direct->replica_count() == 2) {
+            const size_t split =
+                expert_ssd_internal_stripe_bytes(total_bytes[index]);
+            advised.push_back(
+                direct->advise_read_slice_from(
+                    0, expert_ids[index], 0, split) +
+                direct->advise_read_slice_from(
+                    1, expert_ids[index], split, total_bytes[index]));
+          } else {
+            advised.push_back(
+                direct->advise_read(expert_ids[index], total_bytes[index]));
+          }
         }
         return advised;
       },
