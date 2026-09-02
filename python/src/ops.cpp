@@ -2769,6 +2769,23 @@ void init_ops(nb::module_& m) {
       nb::sig(
           "def _expert_ssd_scalex_mxfp4_qmv(x: array, weight: array, scale_records: array, routes: array, projection: int) -> array"));
   m.def(
+      "_expert_ssd_scalex_mxfp4_width2_pair_qmv",
+      [](const mx::array& x,
+         const mx::array& up_weight,
+         const mx::array& gate_weight,
+         const mx::array& scale_records,
+         const mx::array& routes) {
+        return mx::expert_ssd_scalex_mxfp4_width2_pair_qmv(
+            x, up_weight, gate_weight, scale_records, routes);
+      },
+      "x"_a,
+      "up_weight"_a,
+      "gate_weight"_a,
+      "scale_records"_a,
+      "routes"_a,
+      nb::sig(
+          "def _expert_ssd_scalex_mxfp4_width2_pair_qmv(x: array, up_weight: array, gate_weight: array, scale_records: array, routes: array) -> list[array]"));
+  m.def(
       "_expert_ssd_scalex_mxfp4_qmv_two_bank",
       [](const mx::array& x,
          const mx::array& private_weight,

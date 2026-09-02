@@ -541,6 +541,73 @@ METAL_FUNC void dsv4_scalex_qmv_fast_impl(
       simd_lid);
 }
 
+// GLM verifier fast path: two token rows, eight routes per row, and the
+// independent Up/Gate projections share one dispatch. Each projection still
+// runs through the exact width-one ScaleX QMV reduction; this only removes
+// three command-encoder/kernel-launch boundaries from every MoE layer.
+[[kernel]] void dsv4_scalex_mxfp4_width2_pair_qmv_bf16(
+    const device uint32_t* up_weight [[buffer(0)]],
+    const device uint32_t* gate_weight [[buffer(1)]],
+    const device uint8_t* scale_records [[buffer(2)]],
+    const device bfloat16_t* x [[buffer(3)]],
+    const device uint32_t* routes [[buffer(4)]],
+    device bfloat16_t* up_output [[buffer(5)]],
+    device bfloat16_t* gate_output [[buffer(6)]],
+    const constant int& in_vec_size [[buffer(7)]],
+    const constant int& out_vec_size [[buffer(8)]],
+    const constant int& record_stride [[buffer(9)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  threadgroup uint8_t scale_tile[1024];
+  const uint route_position = tid.z;
+  const uint slot = routes[route_position];
+  if (slot == 0xffffffffu) {
+    if (simd_lid < 4u) {
+      const uint row = tid.y * 8u + simd_gid * 4u + simd_lid;
+      if (row < uint(out_vec_size)) {
+        up_output[ulong(route_position) * ulong(out_vec_size) + row] =
+            bfloat16_t(0.0f);
+        gate_output[ulong(route_position) * ulong(out_vec_size) + row] =
+            bfloat16_t(0.0f);
+      }
+    }
+    return;
+  }
+  const ulong weight_stride =
+      ulong(out_vec_size) * ulong(in_vec_size / 8);
+  const uint scale_count = uint(out_vec_size * (in_vec_size / 32));
+  const device uint8_t* record =
+      scale_records + ulong(slot) * ulong(record_stride);
+  const device bfloat16_t* route_x =
+      x + ulong(route_position >> 3) * ulong(in_vec_size);
+  const uint3 qmv_tid(0u, tid.y, 0u);
+  dsv4_scalex_qmv_fast_impl<bfloat16_t, 32, 4>(
+      up_weight + ulong(slot) * weight_stride,
+      record,
+      scale_tile + simd_gid * 512u,
+      2u * scale_count,
+      route_x,
+      up_output + ulong(route_position) * ulong(out_vec_size),
+      in_vec_size,
+      out_vec_size,
+      qmv_tid,
+      simd_gid,
+      simd_lid);
+  dsv4_scalex_qmv_fast_impl<bfloat16_t, 32, 4>(
+      gate_weight + ulong(slot) * weight_stride,
+      record,
+      scale_tile + simd_gid * 512u,
+      0u,
+      route_x,
+      gate_output + ulong(route_position) * ulong(out_vec_size),
+      in_vec_size,
+      out_vec_size,
+      qmv_tid,
+      simd_gid,
+      simd_lid);
+}
+
 // One logical QMV over two physical slot banks. Bank selection is uniform for
 // every threadgroup because tid.z names one routed expert, so this preserves
 // the single-bank dispatch topology without route partitioning.
@@ -700,7 +767,7 @@ METAL_FUNC void dsv4_scalex_qmv_fast_impl(
       simd_lid);
 }
 
-// Fixed-width/top-six Down projection with the exact BF16 score-reduction
+// Fixed-width Down projection with the exact BF16 score-reduction
 // order and shared-expert add folded into the same dispatch. Width two and
 // width three have separate Metal entry points but deliberately share this
 // arithmetic body so both preserve canonical width-one route accumulation.
@@ -720,6 +787,7 @@ METAL_FUNC void dsv4_scalex_mxfp4_fixed_down_reduce_bf16_impl(
     const constant int& out_vec_size,
     const constant int& private_record_stride,
     const constant int& shared_record_stride,
+    const constant uint& topk,
     const bool two_bank,
     threadgroup uint8_t* scale_tile,
     uint3 tid,
@@ -732,7 +800,6 @@ METAL_FUNC void dsv4_scalex_mxfp4_fixed_down_reduce_bf16_impl(
   constexpr int values_per_thread = pack_factor * packs_per_thread;
   constexpr int block_size = values_per_thread * SIMD_SIZE;
   constexpr int scale_step_per_thread = 32 / values_per_thread;
-  constexpr uint topk = 6u;
   const uint token = tid.z;
   const int out_row = tid.y * 8 + simd_gid * results_per_simdgroup;
   const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
@@ -864,6 +931,7 @@ METAL_FUNC void dsv4_scalex_mxfp4_fixed_down_reduce_bf16_impl(
     const constant int& in_vec_size [[buffer(8)]],
     const constant int& out_vec_size [[buffer(9)]],
     const constant int& record_stride [[buffer(10)]],
+    const constant uint& topk [[buffer(11)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -884,6 +952,7 @@ METAL_FUNC void dsv4_scalex_mxfp4_fixed_down_reduce_bf16_impl(
       out_vec_size,
       record_stride,
       record_stride,
+      topk,
       false,
       scale_tile,
       tid,
@@ -903,6 +972,7 @@ METAL_FUNC void dsv4_scalex_mxfp4_fixed_down_reduce_bf16_impl(
     const constant int& in_vec_size [[buffer(8)]],
     const constant int& out_vec_size [[buffer(9)]],
     const constant int& record_stride [[buffer(10)]],
+    const constant uint& topk [[buffer(11)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -923,6 +993,7 @@ METAL_FUNC void dsv4_scalex_mxfp4_fixed_down_reduce_bf16_impl(
       out_vec_size,
       record_stride,
       record_stride,
+      topk,
       false,
       scale_tile,
       tid,
@@ -946,6 +1017,7 @@ METAL_FUNC void dsv4_scalex_mxfp4_fixed_down_reduce_bf16_impl(
     const constant int& out_vec_size [[buffer(12)]],
     const constant int& private_record_stride [[buffer(13)]],
     const constant int& shared_record_stride [[buffer(14)]],
+    const constant uint& topk [[buffer(15)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -966,6 +1038,7 @@ METAL_FUNC void dsv4_scalex_mxfp4_fixed_down_reduce_bf16_impl(
       out_vec_size,
       private_record_stride,
       shared_record_stride,
+      topk,
       true,
       scale_tile,
       tid,
@@ -989,6 +1062,7 @@ METAL_FUNC void dsv4_scalex_mxfp4_fixed_down_reduce_bf16_impl(
     const constant int& out_vec_size [[buffer(12)]],
     const constant int& private_record_stride [[buffer(13)]],
     const constant int& shared_record_stride [[buffer(14)]],
+    const constant uint& topk [[buffer(15)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -1009,6 +1083,7 @@ METAL_FUNC void dsv4_scalex_mxfp4_fixed_down_reduce_bf16_impl(
       out_vec_size,
       private_record_stride,
       shared_record_stride,
+      topk,
       true,
       scale_tile,
       tid,
