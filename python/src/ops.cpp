@@ -461,6 +461,46 @@ class ExpertSSDRouteCacheState {
     return output;
   }
 
+  size_t try_all_hit(const mx::array& indices) {
+    std::vector<int64_t> routed;
+    if (indices.dtype() == mx::int32) {
+      flatten<int32_t>(indices, routed);
+    } else if (indices.dtype() == mx::int64) {
+      flatten<int64_t>(indices, routed);
+    } else if (indices.dtype() == mx::uint32) {
+      flatten<uint32_t>(indices, routed);
+    } else if (indices.dtype() == mx::uint64) {
+      flatten<uint64_t>(indices, routed);
+    } else {
+      throw std::invalid_argument(
+          "ExpertSSD route-cache indices must be integral");
+    }
+    if (routed.empty()) {
+      throw std::invalid_argument(
+          "ExpertSSD live all-hit route cannot be empty");
+    }
+    std::unordered_set<int64_t> unique;
+    unique.reserve(std::min<size_t>(routed.size(), expert_count_));
+    for (const auto expert : routed) {
+      validate_expert(expert);
+      unique.insert(expert);
+      if (expert_to_slot_[expert] < 0 ||
+          down_expert_to_slot_[expert] < 0) {
+        return 0;
+      }
+    }
+    if (unique.size() > capacity_) {
+      throw std::invalid_argument(
+          "ExpertSSD live route exceeds native cache capacity");
+    }
+
+    // The decision and its policy transition are one native transaction over
+    // the live router result. A miss is observational only; an all-hit route
+    // receives exactly the same Markov/LHD update as plan().
+    replay_all_hit_routes({routed});
+    return unique.size();
+  }
+
   void replay_all_hit_routes(
       const std::vector<std::vector<int64_t>>& routes) {
     for (const auto& routed : routes) {
@@ -902,6 +942,39 @@ class ExpertSSDGlobalPoolState {
     hits_ += output.hits;
     misses_ += output.misses;
     return output;
+  }
+
+  size_t try_all_hit(int64_t layer, const mx::array& indices) {
+    auto& state = layer_state(layer);
+    const auto layer_index = layer_lookup_.at(layer);
+    std::vector<int64_t> routed;
+    flatten(indices, routed);
+    if (routed.empty()) {
+      throw std::invalid_argument(
+          "ExpertSSD global-pool live all-hit route cannot be empty");
+    }
+    std::unordered_set<int64_t> unique;
+    unique.reserve(std::min<size_t>(routed.size(), expert_count_));
+    for (const auto expert : routed) {
+      validate_expert(expert);
+      unique.insert(expert);
+      const auto private_row = state.expert_to_row[expert];
+      const auto shared_row = shared_rows_[key(layer_index, expert)];
+      if ((private_row >= 0) == (shared_row >= 0)) {
+        if (private_row < 0) {
+          return 0;
+        }
+        throw std::invalid_argument(
+            "ExpertSSD global-pool bank maps diverged");
+      }
+    }
+    if (unique.size() > state.capacity + shared_capacity_) {
+      throw std::invalid_argument(
+          "ExpertSSD global-pool live route exceeds cache capacity");
+    }
+
+    replay_all_hit_route(layer, routed);
+    return unique.size();
   }
 
   void replay_all_hit_route(
@@ -2505,6 +2578,27 @@ void init_ops(nb::module_& m) {
       nb::sig(
           "def _expert_ssd_route_cache_replay_all_hits(state: _ExpertSSDRouteCacheState, routes: list[list[int]]) -> None"));
   m.def(
+      "_expert_ssd_route_cache_try_all_hit",
+      [](std::shared_ptr<ExpertSSDRouteCacheState> state, mx::array indices) {
+        if (!state || indices.ndim() == 0) {
+          throw std::invalid_argument(
+              "ExpertSSD route-cache state and routed indices are required");
+        }
+        for (auto stride : indices.strides()) {
+          if (stride < 0) {
+            throw std::invalid_argument(
+                "ExpertSSD route-cache negative strides are unsupported");
+          }
+        }
+        nb::gil_scoped_release release;
+        indices.eval();
+        return state->try_all_hit(indices);
+      },
+      "state"_a,
+      "indices"_a,
+      nb::sig(
+          "def _expert_ssd_route_cache_try_all_hit(state: _ExpertSSDRouteCacheState, indices: array) -> int"));
+  m.def(
       "_expert_ssd_global_pool_state_new",
       [](size_t expert_count,
          const std::vector<int64_t>& layers,
@@ -2640,6 +2734,30 @@ void init_ops(nb::module_& m) {
       "routed"_a,
       nb::sig(
           "def _expert_ssd_global_pool_replay_all_hit(state: _ExpertSSDGlobalPoolState, layer: int, routed: list[int]) -> None"));
+  m.def(
+      "_expert_ssd_global_pool_try_all_hit",
+      [](std::shared_ptr<ExpertSSDGlobalPoolState> state,
+         int64_t layer,
+         mx::array indices) {
+        if (!state || indices.ndim() == 0) {
+          throw std::invalid_argument(
+              "ExpertSSD global-pool state and routed indices are required");
+        }
+        for (auto stride : indices.strides()) {
+          if (stride < 0) {
+            throw std::invalid_argument(
+                "ExpertSSD global-pool negative strides are unsupported");
+          }
+        }
+        nb::gil_scoped_release release;
+        indices.eval();
+        return state->try_all_hit(layer, indices);
+      },
+      "state"_a,
+      "layer"_a,
+      "indices"_a,
+      nb::sig(
+          "def _expert_ssd_global_pool_try_all_hit(state: _ExpertSSDGlobalPoolState, layer: int, indices: array) -> int"));
   m.def(
       "_expert_ssd_global_pool_restore_rows",
       [](std::shared_ptr<ExpertSSDGlobalPoolState> state,
