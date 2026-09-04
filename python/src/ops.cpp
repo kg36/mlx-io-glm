@@ -342,7 +342,9 @@ class ExpertSSDRouteCacheState {
     lhd_interval_ema_ = interval_ema;
   }
 
-  ExpertSSDRouteCachePlan plan(const mx::array& indices) {
+  ExpertSSDRouteCachePlan plan(
+      const mx::array& indices,
+      const std::vector<uint8_t>& active_mask = {}) {
     ExpertSSDRouteCachePlan output;
     if (indices.dtype() == mx::int32) {
       flatten<int32_t>(indices, output.routed);
@@ -356,6 +358,9 @@ class ExpertSSDRouteCacheState {
       throw std::invalid_argument(
           "ExpertSSD route-cache indices must be integral");
     }
+    if (!active_mask.empty() && active_mask.size() != output.routed.size()) {
+      throw std::invalid_argument("ExpertSSD active mask must match route size");
+    }
     output.compact.reserve(output.routed.size());
     std::unordered_map<int64_t, int32_t> compact_ids;
     compact_ids.reserve(std::min<size_t>(output.routed.size(), expert_count_));
@@ -368,7 +373,9 @@ class ExpertSSDRouteCacheState {
         output.counts.push_back(0);
       }
       output.compact.push_back(iterator->second);
-      output.counts[iterator->second] += 1;
+      const auto position = output.compact.size() - 1;
+      output.counts[iterator->second] +=
+          active_mask.empty() || active_mask[position] != 0;
     }
     if (output.unique.size() > capacity_) {
       throw std::invalid_argument(
@@ -386,19 +393,42 @@ class ExpertSSDRouteCacheState {
       output.resident_before.push_back(expert_to_slot_[expert] >= 0);
     }
 
+    std::vector<int64_t> active_unique;
+    std::vector<int32_t> active_counts;
+    // A filler in position 0 may be a real expert in position 1. Policy
+    // ordering must follow its first *active* occurrence, not its filler.
+    std::vector<uint8_t> active_seen(active_mask.empty() ? 0 : output.unique.size(), 0);
+    for (size_t p = 0; p < active_mask.size(); ++p) {
+      const auto i = output.compact[p];
+      if (active_mask[p] && !active_seen[i]) {
+        active_seen[i] = 1;
+        active_unique.push_back(output.unique[i]);
+        active_counts.push_back(output.counts[i]);
+      }
+    }
+    for (size_t i = 0; !active_mask.empty() && i < output.unique.size(); ++i) {
+      if (output.counts[i] == 0 && !output.resident_before[i]) {
+        throw std::invalid_argument("ExpertSSD inactive filler must be resident");
+      }
+    }
+    const auto& demand_unique = active_mask.empty() ? output.unique : active_unique;
+    const auto& demand_counts = active_mask.empty() ? output.counts : active_counts;
+    if (demand_unique.empty()) {
+      throw std::invalid_argument("ExpertSSD route must have an active expert");
+    }
     decay_retention();
     std::vector<double> markov_scores(expert_count_, 0.0);
     if (markov_) {
       const auto scores = markov_->update_and_score(
-          output.unique, resident_before);
+          demand_unique, resident_before);
       for (size_t index = 0; index < resident_before.size(); ++index) {
         markov_scores[resident_before[index]] = scores[index];
       }
     }
-    record_lhd_accesses(output.unique, output.counts);
+    record_lhd_accesses(demand_unique, demand_counts);
 
-    for (size_t index = 0; index < output.unique.size(); ++index) {
-      const auto expert = output.unique[index];
+    // Inactive rows remain pinned for the kernel, but are not demands.
+    for (const auto expert : demand_unique) {
       auto slot = expert_to_slot_[expert];
       if (slot >= 0) {
         touch(expert);
@@ -828,10 +858,15 @@ class ExpertSSDGlobalPoolState {
     }
   }
 
-  ExpertSSDGlobalPoolPlan plan(int64_t layer, const mx::array& indices) {
+  ExpertSSDGlobalPoolPlan plan(
+      int64_t layer, const mx::array& indices,
+      const std::vector<uint8_t>& active_mask = {}) {
     auto& state = layer_state(layer);
     ExpertSSDGlobalPoolPlan output;
     flatten(indices, output.routed);
+    if (!active_mask.empty() && active_mask.size() != output.routed.size()) {
+      throw std::invalid_argument("ExpertSSD active mask must match route size");
+    }
     output.compact.reserve(output.routed.size());
     std::unordered_map<int64_t, int32_t> compact_ids;
     compact_ids.reserve(std::min<size_t>(output.routed.size(), expert_count_));
@@ -844,7 +879,9 @@ class ExpertSSDGlobalPoolState {
         output.counts.push_back(0);
       }
       output.compact.push_back(iterator->second);
-      output.counts[iterator->second] += 1;
+      const auto position = output.compact.size() - 1;
+      output.counts[iterator->second] +=
+          active_mask.empty() || active_mask[position] != 0;
     }
     if (output.unique.size() > state.capacity + shared_capacity_) {
       throw std::invalid_argument(
@@ -860,18 +897,38 @@ class ExpertSSDGlobalPoolState {
           shared_rows_[key(layer_index, expert)] >= 0);
     }
 
+    std::vector<int64_t> active_unique;
+    std::vector<int32_t> active_counts;
+    std::vector<uint8_t> active_seen(active_mask.empty() ? 0 : output.unique.size(), 0);
+    for (size_t p = 0; p < active_mask.size(); ++p) {
+      const auto i = output.compact[p];
+      if (active_mask[p] && !active_seen[i]) {
+        active_seen[i] = 1;
+        active_unique.push_back(output.unique[i]);
+        active_counts.push_back(output.counts[i]);
+      }
+    }
+    for (size_t i = 0; !active_mask.empty() && i < output.unique.size(); ++i) {
+      if (output.counts[i] == 0 && !output.resident_before[i]) {
+        throw std::invalid_argument("ExpertSSD inactive filler must be resident");
+      }
+    }
+    const auto& demand_unique = active_mask.empty() ? output.unique : active_unique;
+    const auto& demand_counts = active_mask.empty() ? output.counts : active_counts;
+    if (demand_unique.empty()) {
+      throw std::invalid_argument("ExpertSSD route must have an active expert");
+    }
     ++state.call_index;
     decay_retention(state);
     std::vector<int64_t> all_experts(expert_count_);
     std::iota(all_experts.begin(), all_experts.end(), 0);
     const auto markov_scores = state.markov->update_and_score(
-        output.unique, all_experts);
-    record_route_intervals(state, output.unique);
-    record_lhd_accesses(state, output.unique, output.counts);
+        demand_unique, all_experts);
+    record_route_intervals(state, demand_unique);
+    record_lhd_accesses(state, demand_unique, demand_counts);
     refresh_layer_retention(layer_index, state, markov_scores);
 
-    for (size_t index = 0; index < output.unique.size(); ++index) {
-      const auto expert = output.unique[index];
+    for (const auto expert : demand_unique) {
       auto private_row = state.expert_to_row[expert];
       auto shared_row = shared_rows_[key(layer_index, expert)];
       if (private_row >= 0 || shared_row >= 0) {
@@ -936,7 +993,7 @@ class ExpertSSDGlobalPoolState {
       output.rows.push_back(shared_row >= 0 ? shared_row : private_row);
     }
     const auto miss_ratio = static_cast<double>(output.misses) /
-        static_cast<double>(std::max<size_t>(1, output.unique.size()));
+        static_cast<double>(demand_unique.size());
     state.miss_pressure = miss_pressure_alpha_ * miss_ratio +
         (1.0 - miss_pressure_alpha_) * state.miss_pressure;
     hits_ += output.hits;
@@ -2490,7 +2547,8 @@ void init_ops(nb::module_& m) {
           "def _expert_ssd_route_cache_metadata(state: _ExpertSSDRouteCacheState) -> dict"));
   m.def(
       "_expert_ssd_route_cache_plan",
-      [](std::shared_ptr<ExpertSSDRouteCacheState> state, mx::array indices) {
+      [](std::shared_ptr<ExpertSSDRouteCacheState> state, mx::array indices,
+         const std::vector<uint8_t>& active_mask) {
         if (!state || indices.ndim() == 0) {
           throw std::invalid_argument(
               "ExpertSSD route-cache state and routed indices are required");
@@ -2508,7 +2566,7 @@ void init_ops(nb::module_& m) {
           // persistent native cache transaction mutates its policy state.
           nb::gil_scoped_release release;
           indices.eval();
-          plan = state->plan(indices);
+          plan = state->plan(indices, active_mask);
         }
         nb::dict output;
         nb::list unique;
@@ -2560,8 +2618,9 @@ void init_ops(nb::module_& m) {
       },
       "state"_a,
       "indices"_a,
+      "active_mask"_a = std::vector<uint8_t>{},
       nb::sig(
-          "def _expert_ssd_route_cache_plan(state: _ExpertSSDRouteCacheState, indices: array) -> dict"));
+          "def _expert_ssd_route_cache_plan(state: _ExpertSSDRouteCacheState, indices: array, active_mask: list[int] = []) -> dict"));
   m.def(
       "_expert_ssd_route_cache_replay_all_hits",
       [](std::shared_ptr<ExpertSSDRouteCacheState> state,
@@ -2647,7 +2706,8 @@ void init_ops(nb::module_& m) {
       "_expert_ssd_global_pool_plan",
       [](std::shared_ptr<ExpertSSDGlobalPoolState> state,
          int64_t layer,
-         mx::array indices) {
+         mx::array indices,
+         const std::vector<uint8_t>& active_mask) {
         if (!state || indices.ndim() == 0) {
           throw std::invalid_argument(
               "ExpertSSD global-pool state and routed indices are required");
@@ -2662,7 +2722,7 @@ void init_ops(nb::module_& m) {
         {
           nb::gil_scoped_release release;
           indices.eval();
-          plan = state->plan(layer, indices);
+          plan = state->plan(layer, indices, active_mask);
         }
         nb::dict output;
         nb::list unique;
@@ -2715,8 +2775,9 @@ void init_ops(nb::module_& m) {
       "state"_a,
       "layer"_a,
       "indices"_a,
+      "active_mask"_a = std::vector<uint8_t>{},
       nb::sig(
-          "def _expert_ssd_global_pool_plan(state: _ExpertSSDGlobalPoolState, layer: int, indices: array) -> dict"));
+          "def _expert_ssd_global_pool_plan(state: _ExpertSSDGlobalPoolState, layer: int, indices: array, active_mask: list[int] = []) -> dict"));
   m.def(
       "_expert_ssd_global_pool_replay_all_hit",
       [](std::shared_ptr<ExpertSSDGlobalPoolState> state,
