@@ -20,6 +20,8 @@
 #include <variant>
 
 #include <sys/mman.h>
+#include <mach/mach_time.h>
+#include <pthread.h>
 
 #include <dispatch/dispatch.h>
 
@@ -2088,6 +2090,61 @@ size_t expert_ssd_internal_stripe_bytes(size_t total) {
       total, expert_ssd_internal_to_replica_speed_ratio());
 }
 
+// Opt-in tracing only: one disjoint record per native worker task. No Python
+// callbacks, shared trace lock, or clock reads on untraced refills.
+struct ScaleXReadTrace {
+  uint64_t started_ns{0}, finished_ns{0}, thread_id{0}, bytes{0};
+  size_t item{0}, replica{0};
+  bool success{false};
+};
+
+static uint64_t scalex_trace_clock_ns() {
+  static const mach_timebase_info_data_t tb = [] {
+    mach_timebase_info_data_t value;
+    mach_timebase_info(&value);
+    return value;
+  }();
+  return (static_cast<__uint128_t>(mach_absolute_time()) * tb.numer) / tb.denom;
+}
+
+struct ScaleXTraceScope {
+  ScaleXReadTrace* record;
+  explicit ScaleXTraceScope(ScaleXReadTrace* record, size_t item, size_t replica)
+      : record(record) {
+    if (record) {
+      record->item = item;
+      record->replica = replica;
+      pthread_threadid_np(nullptr, &record->thread_id);
+      record->started_ns = scalex_trace_clock_ns();
+    }
+  }
+  ~ScaleXTraceScope() {
+    if (record) record->finished_ns = scalex_trace_clock_ns();
+  }
+};
+
+template <class State>
+static nb::list scalex_read_trace(const std::shared_ptr<State>& state) {
+  if (!state) throw std::invalid_argument("ScaleX trace needs a batch state");
+  std::lock_guard<std::mutex> lock(state->completion_mutex);
+  if (!state->complete) throw std::runtime_error("ScaleX batch is not complete");
+  nb::list result;
+  for (const auto& r : state->read_trace) {
+    if (!r.started_ns) continue;
+    nb::dict row;
+    row["item"] = r.item;
+    row["expert"] = state->expert_ids[r.item];
+    row["replica"] = r.replica;
+    row["started_ns"] = r.started_ns;
+    row["finished_ns"] = r.finished_ns;
+    row["thread_id"] = r.thread_id;
+    row["bytes"] = r.bytes;
+    row["success"] = r.success;
+    result.append(row);
+  }
+  return result;
+}
+
 struct ScaleXAsyncBatchState {
   ScaleXAsyncBatchState(
       std::shared_ptr<mx::ScaleXModeADirect> direct,
@@ -2119,6 +2176,7 @@ struct ScaleXAsyncBatchState {
   std::vector<size_t> expert_ids;
   std::vector<size_t> gate_up_slots;
   std::vector<size_t> down_slots;
+  std::vector<ScaleXReadTrace> read_trace;
   mx::array record_destinations;
   mx::array gate_destinations;
   mx::array down_destinations;
@@ -2152,6 +2210,9 @@ void scalex_async_batch_worker(void* raw, size_t) {
     }
     const size_t item = striped ? task / 2 : task;
     const size_t replica = striped ? task % 2 : 0;
+    ScaleXTraceScope timing(
+        state->read_trace.empty() ? nullptr : &state->read_trace[task],
+        item, replica);
     try {
       const std::array<char*, 3> pointers{
           state->gate_base +
@@ -2167,6 +2228,7 @@ void scalex_async_batch_worker(void* raw, size_t) {
         const size_t split = expert_ssd_internal_stripe_bytes(total);
         const size_t begin = replica == 0 ? 0 : split;
         const size_t end = replica == 0 ? split : total;
+        if (timing.record) timing.record->bytes = end - begin;
         state->direct->load_compressed_expert_slice_into_from(
             replica,
             state->expert_ids[item],
@@ -2177,6 +2239,10 @@ void scalex_async_batch_worker(void* raw, size_t) {
             pointers,
             state->row_nbytes);
       } else {
+        if (timing.record) {
+          timing.record->bytes = state->direct->compressed_expert_nbytes(
+              state->expert_ids[item], state->row_nbytes);
+        }
         state->direct->load_compressed_expert_into(
             state->expert_ids[item],
             record,
@@ -2184,6 +2250,7 @@ void scalex_async_batch_worker(void* raw, size_t) {
             pointers,
             state->row_nbytes);
       }
+      if (timing.record) timing.record->success = true;
     } catch (...) {
       std::lock_guard<std::mutex> lock(state->error_mutex);
       if (!state->error) {
@@ -2270,6 +2337,7 @@ struct ScaleXTwoBankAsyncBatchState {
   std::vector<size_t> expert_ids;
   std::vector<uint8_t> shared_bank;
   std::vector<size_t> rows;
+  std::vector<ScaleXReadTrace> read_trace;
   std::array<mx::array, 4> private_destinations;
   std::array<mx::array, 4> shared_destinations;
   std::array<char*, 4> private_bases{};
@@ -2300,6 +2368,9 @@ void scalex_two_bank_batch_worker(void* raw, size_t) {
     }
     const size_t item = striped ? task / 2 : task;
     const size_t replica = striped ? task % 2 : 0;
+    ScaleXTraceScope timing(
+        state->read_trace.empty() ? nullptr : &state->read_trace[task],
+        item, replica);
     try {
       const auto& bases = state->shared_bank[item]
           ? state->shared_bases
@@ -2319,6 +2390,7 @@ void scalex_two_bank_batch_worker(void* raw, size_t) {
         const size_t split = expert_ssd_internal_stripe_bytes(total);
         const size_t begin = replica == 0 ? 0 : split;
         const size_t end = replica == 0 ? split : total;
+        if (timing.record) timing.record->bytes = end - begin;
         state->direct->load_compressed_expert_slice_into_from(
             replica,
             state->expert_ids[item],
@@ -2329,6 +2401,10 @@ void scalex_two_bank_batch_worker(void* raw, size_t) {
             pointers,
             state->row_nbytes);
       } else {
+        if (timing.record) {
+          timing.record->bytes = state->direct->compressed_expert_nbytes(
+              state->expert_ids[item], state->row_nbytes);
+        }
         state->direct->load_compressed_expert_into(
             state->expert_ids[item],
             record,
@@ -2336,6 +2412,7 @@ void scalex_two_bank_batch_worker(void* raw, size_t) {
             pointers,
             state->row_nbytes);
       }
+      if (timing.record) timing.record->success = true;
     } catch (...) {
       std::lock_guard<std::mutex> lock(state->error_mutex);
       if (!state->error) {
@@ -2399,6 +2476,9 @@ void scalex_two_bank_batch_run(void* raw) {
 }
 
 void init_ops(nb::module_& m) {
+  m.def("_scalex_mode_b_async_trace", &scalex_read_trace<ScaleXAsyncBatchState>);
+  m.def("_scalex_mode_b_two_bank_async_trace",
+        &scalex_read_trace<ScaleXTwoBankAsyncBatchState>);
   nb::class_<mx::ExpertSafetensorsDirect>(m, "_ExpertSafetensorsDirect");
   nb::class_<mx::ScaleXPrefixStore>(m, "_ScaleXPrefixStore");
   nb::class_<mx::ScaleXModeADirect>(m, "_ScaleXModeADirect");
@@ -4159,7 +4239,8 @@ void init_ops(nb::module_& m) {
          size_t worker_count,
          bool interactive_qos,
          std::shared_ptr<mx::ExpertSSDIoEventState> event_state,
-         uint64_t event_value) {
+         uint64_t event_value,
+         bool trace_enabled) {
         if (!direct || !event_state || event_value == 0 ||
             expert_ids.empty() || expert_ids.size() != gate_up_slots.size() ||
             expert_ids.size() != down_slots.size() ||
@@ -4229,6 +4310,8 @@ void init_ops(nb::module_& m) {
             std::move(event_state),
             event_value);
         state->record_row_nbytes = record_row_nbytes;
+        if (trace_enabled) state->read_trace.resize(
+            state->expert_ids.size() * (state->direct->replica_count() == 2 ? 2 : 1));
         state->row_nbytes = {
             weight_row_nbytes[0],
             weight_row_nbytes[1],
@@ -4260,7 +4343,8 @@ void init_ops(nb::module_& m) {
       "event_state"_a,
       "event_value"_a,
       nb::sig(
-          "def _scalex_mode_b_load_full_split_async(direct: _ScaleXModeADirect, expert_ids: list[int], gate_up_slots: list[int], down_slots: list[int], record_destinations: array, gate_destinations: array, down_destinations: array, up_destinations: array, weight_row_nbytes: list[int], worker_count: int, interactive_qos: bool, event_state: _ExpertSSDIoEventState, event_value: int) -> _ScaleXAsyncBatchState"));
+          "def _scalex_mode_b_load_full_split_async(direct: _ScaleXModeADirect, expert_ids: list[int], gate_up_slots: list[int], down_slots: list[int], record_destinations: array, gate_destinations: array, down_destinations: array, up_destinations: array, weight_row_nbytes: list[int], worker_count: int, interactive_qos: bool, event_state: _ExpertSSDIoEventState, event_value: int, trace_enabled: bool = False) -> _ScaleXAsyncBatchState"),
+      "trace_enabled"_a = false);
   m.def(
       "_scalex_mode_b_async_wait",
       [](const std::shared_ptr<ScaleXAsyncBatchState>& state) {
@@ -4302,7 +4386,8 @@ void init_ops(nb::module_& m) {
          size_t worker_count,
          bool interactive_qos,
          std::shared_ptr<mx::ExpertSSDIoEventState> event_state,
-         uint64_t event_value) {
+         uint64_t event_value,
+         bool trace_enabled) {
         if (!direct || !event_state || event_value == 0 ||
             expert_ids.empty() || expert_ids.size() != shared_bank.size() ||
             expert_ids.size() != rows.size() || weight_row_nbytes.size() != 3 ||
@@ -4381,6 +4466,8 @@ void init_ops(nb::module_& m) {
             std::move(event_state),
             event_value);
         state->private_record_row_nbytes = private_record_nbytes;
+        if (trace_enabled) state->read_trace.resize(
+            state->expert_ids.size() * (state->direct->replica_count() == 2 ? 2 : 1));
         state->shared_record_row_nbytes = shared_record_nbytes;
         state->row_nbytes = {
             weight_row_nbytes[0],
@@ -4419,7 +4506,8 @@ void init_ops(nb::module_& m) {
       "event_state"_a,
       "event_value"_a,
       nb::sig(
-          "def _scalex_mode_b_load_full_split_two_bank_async(direct: _ScaleXModeADirect, expert_ids: list[int], shared_bank: list[bool], rows: list[int], private_record: array, private_gate: array, private_down: array, private_up: array, shared_record: array, shared_gate: array, shared_down: array, shared_up: array, weight_row_nbytes: list[int], worker_count: int, interactive_qos: bool, event_state: _ExpertSSDIoEventState, event_value: int) -> _ScaleXTwoBankAsyncBatchState"));
+          "def _scalex_mode_b_load_full_split_two_bank_async(direct: _ScaleXModeADirect, expert_ids: list[int], shared_bank: list[bool], rows: list[int], private_record: array, private_gate: array, private_down: array, private_up: array, shared_record: array, shared_gate: array, shared_down: array, shared_up: array, weight_row_nbytes: list[int], worker_count: int, interactive_qos: bool, event_state: _ExpertSSDIoEventState, event_value: int, trace_enabled: bool = False) -> _ScaleXTwoBankAsyncBatchState"),
+      "trace_enabled"_a = false);
   m.def(
       "_scalex_mode_b_two_bank_async_wait",
       [](const std::shared_ptr<ScaleXTwoBankAsyncBatchState>& state) {
