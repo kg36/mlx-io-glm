@@ -83,6 +83,11 @@ def cross_entropy(
             f"Targets shape {targets.shape} does not match logits shape {logits.shape}."
         )
 
+    # Shift by the max first. The loss only depends on differences between
+    # logits, but subtracting the logsumexp of large logits loses the gap to
+    # rounding before the subtraction happens.
+    logits = logits - mx.stop_gradient(mx.max(logits, axis=axis, keepdims=True))
+
     if targets_as_probs:
         score = mx.sum(logits * targets, axis=axis)
     else:
@@ -416,8 +421,9 @@ def triplet_loss(
           ``'none'`` | ``'mean'`` | ``'sum'``. Default: ``'none'``.
 
     Returns:
-        array: Computed triplet loss. If reduction is "none", returns a tensor of the same shape as input;
-                  if reduction is "mean" or "sum", returns a scalar tensor.
+        array: Computed triplet loss. If reduction is ``"none"``, returns a tensor with the
+          same shape as the inputs but with the ``axis`` dimension removed; if reduction
+          is ``"mean"`` or ``"sum"``, returns a scalar tensor.
     """
     pos_dist = mx.power(
         mx.power(mx.abs(anchors - positives), p).sum(axis) + eps, 1.0 / p
@@ -504,8 +510,7 @@ def log_cosh_loss(
     .. math::
 
        \text{logcosh}(y_{\text{true}}, y_{\text{pred}}) =
-            \frac{1}{n} \sum_{i=1}^{n}
-            \log(\cosh(y_{\text{pred}}^{(i)} - y_{\text{true}}^{(i)}))
+            \log(\cosh(y_{\text{pred}} - y_{\text{true}}))
 
 
     Args:
@@ -540,8 +545,8 @@ def cosine_similarity_loss(
         \frac{x_1 \cdot x_2}{\max(\|x_1\|  \cdot \|x_2\|, \epsilon)}
 
     Args:
-        x1 (mx.array): The first set of inputs.
-        x2 (mx.array): The second set of inputs.
+        x1 (array): The first set of inputs.
+        x2 (array): The second set of inputs.
         axis (int, optional): The embedding axis. Default: ``1``.
         eps (float, optional): The minimum value of the denominator used for
           numerical stability. Default: ``1e-8``.
@@ -549,7 +554,7 @@ def cosine_similarity_loss(
           ``'none'`` | ``'mean'`` | ``'sum'``. Default: ``'none'``.
 
     Returns:
-        mx.array: The computed cosine similarity loss.
+        array: The computed cosine similarity loss.
     """
     x1_norm = mx.linalg.norm(x1, axis=axis)
     x2_norm = mx.linalg.norm(x2, axis=axis)
