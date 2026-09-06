@@ -3288,6 +3288,14 @@ void init_ops(nb::module_& m) {
       nb::sig(
           "def _expert_ssd_gpu_event_signal(x: array, state: _ExpertSSDIoEventState, value: int) -> array"));
   m.def(
+      "_livseek_legacy_mxfp4_quantize",
+      [](const mx::array& weight) {
+        return mx::livseek_legacy_mxfp4_quantize(weight);
+      },
+      "weight"_a,
+      nb::sig(
+          "def _livseek_legacy_mxfp4_quantize(weight: array) -> list[array]"));
+  m.def(
       "_expert_ssd_mxfp4_pair_qmv",
       [](const mx::array& x,
          const mx::array& up_weight,
@@ -6890,7 +6898,7 @@ void init_ops(nb::module_& m) {
       },
       nb::arg(),
       "indices"_a,
-      "axis"_a.none(),
+      "axis"_a = nb::none(),
       nb::kw_only(),
       "stream"_a = nb::none(),
       nb::sig(

@@ -61,6 +61,7 @@ jobs:
               "_scalex_mode_a_prefix_stats",
               "_scalex_mode_a_load_into_many",
               "_scalex_mode_a_load_experts_into_many",
+              "_livseek_legacy_mxfp4_quantize",
           )
           missing = [name for name in required if not hasattr(mx, name)]
           if missing:

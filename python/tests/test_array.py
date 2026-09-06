@@ -49,6 +49,37 @@ class TestVersion(mlx_tests.MLXTestCase):
         self.assertEqual(v, mx.__version__[: len(v)])
 
 
+class TestArrayNamespsceInfo(mlx_tests.MLXTestCase):
+    def test(self):
+        namespace = mx.__array_namespace_info__()
+
+        self.assertEqual(namespace.default_device(), mx.default_device())
+        self.assertEqual(
+            namespace.default_dtypes(),
+            {
+                "real floating": mx.float32,
+                "complex floating": mx.complex64,
+                "integral": mx.int32,
+                "indexing": mx.int32,
+            },
+        )
+        self.assertEqual(
+            namespace.dtypes(device=mx.Device(mx.cpu), kind="real floating"),
+            {"float32": mx.float32, "float64": mx.float64},
+        )
+        if mx.is_available(mx.gpu):
+            self.assertEqual(
+                namespace.dtypes(device=mx.Device(mx.gpu), kind="real floating"),
+                {"float32": mx.float32},
+            )
+        self.assertEqual(
+            namespace.dtypes(kind=("bool", "complex floating")),
+            {"bool": mx.bool_, "complex64": mx.complex64},
+        )
+        with self.assertRaises(ValueError):
+            namespace.dtypes(kind="invalid")
+
+
 class TestDtypes(mlx_tests.MLXTestCase):
     def test_dtypes(self):
         self.assertEqual(mx.bool_.size, 1)
@@ -1278,6 +1309,28 @@ class TestArray(mlx_tests.MLXTestCase):
 
         a[0:2] = 3
         self.assertEqual(a.tolist(), [3, 3, 1])
+
+        # Assigning through a bare Ellipsis, like a[:] and a[None]
+        e = mx.zeros((2, 3), mx.int32)
+        e[...] = 5
+        self.assertEqual(e.tolist(), [[5, 5, 5], [5, 5, 5]])
+
+        # Broadcasting an array update through Ellipsis
+        e[...] = mx.array([1, 2, 3])
+        self.assertEqual(e.tolist(), [[1, 2, 3], [1, 2, 3]])
+
+        e[...] = mx.zeros((2, 3), mx.int32)
+        self.assertEqual(e.tolist(), [[0, 0, 0], [0, 0, 0]])
+
+        # Scalar array
+        e = mx.array(0)
+        e[...] = 7
+        self.assertEqual(e.item(), 7)
+
+        # Shapes that cannot broadcast are still rejected
+        e = mx.zeros((2, 3), mx.int32)
+        with self.assertRaises(ValueError):
+            e[...] = mx.array([1, 2])
 
         a[0:3] = 4
         self.assertEqual(a.tolist(), [4, 4, 4])

@@ -1,5 +1,6 @@
 // Copyright © 2026 Apple Inc.
 
+#include <algorithm>
 #include <stdexcept>
 
 #include "mlx/backend/metal/device.h"
@@ -76,6 +77,51 @@ class ExpertSSDGpuEventSignal : public UnaryPrimitive {
  private:
   std::shared_ptr<ExpertSSDIoEventState> state_;
   uint64_t value_;
+};
+
+class LivSeekLegacyMXFP4Quantize : public Primitive {
+ public:
+  explicit LivSeekLegacyMXFP4Quantize(Stream stream) : Primitive(stream) {}
+
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+    throw std::runtime_error(
+        "[LivSeekLegacyMXFP4Quantize] CPU evaluation not supported");
+  }
+
+  void eval_gpu(
+      const std::vector<array>& inputs,
+      std::vector<array>& outputs) override {
+    if (inputs.size() != 1 || outputs.size() != 2) {
+      throw std::runtime_error(
+          "[LivSeekLegacyMXFP4Quantize] invalid input/output arity");
+    }
+    const auto& weight = inputs[0];
+    if (!weight.flags().row_contiguous) {
+      throw std::runtime_error(
+          "[LivSeekLegacyMXFP4Quantize] input must be row-contiguous");
+    }
+    for (auto& output : outputs) {
+      output.set_data(allocator::malloc(output.nbytes()));
+    }
+
+    auto& device = metal::device(stream().device);
+    auto* kernel = device.get_kernel(
+        weight.dtype() == bfloat16 ? "dsv4_legacy_mxfp4_quantize_bf16"
+                                   : "dsv4_legacy_mxfp4_quantize_f32");
+    auto& encoder = metal::get_command_encoder(stream());
+    encoder.set_compute_pipeline_state(kernel);
+    encoder.set_input_array(weight, 0);
+    encoder.set_output_array(outputs[0], 1);
+    encoder.set_output_array(outputs[1], 2);
+
+    size_t group_size = std::min<size_t>(
+        256, kernel->maxTotalThreadsPerThreadgroup());
+    group_size -= group_size % 32;
+    encoder.dispatch_threads(
+        MTL::Size(weight.size(), 1, 1), MTL::Size(group_size, 1, 1));
+  }
+
+  DEFINE_NAME(LivSeekLegacyMXFP4Quantize)
 };
 
 class ExpertSSDMXFP4PairQMV : public Primitive {
@@ -1377,6 +1423,32 @@ array expert_ssd_gpu_event_signal(
       x.dtype(),
       std::make_shared<ExpertSSDGpuEventSignal>(stream, state, value),
       {x});
+}
+
+std::vector<array> livseek_legacy_mxfp4_quantize(
+    const array& weight,
+    StreamOrDevice s) {
+  if ((weight.dtype() != bfloat16 && weight.dtype() != float32) ||
+      weight.ndim() < 2 ||
+      weight.shape(-1) % 32 != 0) {
+    throw std::invalid_argument(
+        "[livseek_legacy_mxfp4_quantize] requires BF16/FP32 rows divisible by 32");
+  }
+  auto stream = to_stream(s, Device::gpu);
+  if (stream.device != Device::gpu) {
+    throw std::invalid_argument(
+        "[livseek_legacy_mxfp4_quantize] requires a GPU stream");
+  }
+
+  auto packed_shape = weight.shape();
+  packed_shape.back() /= 8;
+  auto scales_shape = weight.shape();
+  scales_shape.back() /= 32;
+  return array::make_arrays(
+      {std::move(packed_shape), std::move(scales_shape)},
+      {uint32, uint8},
+      std::make_shared<LivSeekLegacyMXFP4Quantize>(stream),
+      {weight});
 }
 
 std::vector<array> expert_ssd_mxfp4_pair_qmv(

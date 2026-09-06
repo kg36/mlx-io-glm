@@ -159,6 +159,20 @@ class TestOps(mlx_tests.MLXTestCase):
         self.assertEqual(mx.ones([2, 3]).shape, (2, 3))
         self.assertEqual(mx.full((2, 3), 1.5).tolist(), [[1.5] * 3] * 2)
 
+    def test_integer_index_protocol(self):
+        a = mx.arange(4)
+
+        index = np.int32(2)
+        self.assertEqual(mx.topk(a, index).shape, (2,))
+        self.assertEqual(mx.reshape(a, [index, 2]).shape, (2, 2))
+
+        for value in (np.float32(2), "2"):
+            with self.subTest(value=value):
+                with self.assertRaises(TypeError):
+                    mx.topk(a, value)
+                with self.assertRaises(TypeError):
+                    mx.reshape(a, [value, 2])
+
     def test_scalar_inputs(self):
         # Check combinations of python types
         a = mx.add(False, True)
@@ -991,6 +1005,38 @@ class TestOps(mlx_tests.MLXTestCase):
         out_np = np.median(x, axis=(0, 1, 3), keepdims=True)
         self.assertTrue(np.allclose(out, out_np))
 
+    def test_median_nan(self):
+        nan = float("nan")
+
+        # Odd and even lengths, with the NaN in a few different positions.
+        for vals in ([1.0, nan, 0.0], [nan, 1.0, 0.0], [1.0, 2.0, nan, 4.0]):
+            for dtype in (mx.float16, mx.bfloat16, mx.float32):
+                out = mx.median(mx.array(vals, dtype=dtype))
+                self.assertTrue(mx.isnan(out).item(), msg=f"{vals} {dtype}")
+
+        x = mx.array([[1.0, nan, 3.0], [4.0, 5.0, 6.0]])
+        self.assertTrue(
+            np.array_equal(
+                np.array(mx.median(x, axis=1)), np.median(x, axis=1), equal_nan=True
+            )
+        )
+        self.assertTrue(
+            np.array_equal(
+                np.array(mx.median(x, axis=0)), np.median(x, axis=0), equal_nan=True
+            )
+        )
+        self.assertTrue(mx.isnan(mx.median(x)).item())
+        self.assertEqual(mx.median(x, axis=1, keepdims=True).shape, (2, 1))
+
+        # Complex NaN propagates too, matching NumPy.
+        out = mx.median(mx.array([complex(1, 0), complex(nan, 0), complex(0, 0)]))
+        self.assertTrue(mx.isnan(out).item())
+
+        # A NaN-free array is unaffected, and integers are never NaN.
+        x = mx.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+        self.assertTrue(np.allclose(mx.median(x, axis=1), np.median(x, axis=1)))
+        self.assertEqual(mx.median(mx.array([0, 1, 2, 3, 4])).item(), 2)
+
     def test_var(self):
         x = mx.array(
             [
@@ -1354,6 +1400,21 @@ class TestOps(mlx_tests.MLXTestCase):
         self.assertEqual(mx.any(a, axis=[1]).tolist(), [True, False])
         self.assertEqual(mx.any(a, axis=0).tolist(), [True, False])
         self.assertEqual(mx.any(a, axis=1).tolist(), [True, False])
+
+    def test_subnormal_bool_cast(self):
+        f32_sub = mx.array(np.array([0x00000001], dtype=np.uint32)).view(mx.float32)
+        f16_sub = mx.array(np.array([0x0001], dtype=np.uint16)).view(mx.float16)
+        bf16_sub = mx.array(np.array([0x0001], dtype=np.uint16)).view(mx.bfloat16)
+
+        self.assertTrue(f32_sub.astype(mx.bool_).item())
+        self.assertTrue(f16_sub.astype(mx.bool_).item())
+        self.assertTrue(bf16_sub.astype(mx.bool_).item())
+        self.assertTrue(mx.any(f32_sub).item())
+        self.assertTrue(mx.any(f16_sub).item())
+        self.assertTrue(mx.any(bf16_sub).item())
+        self.assertTrue(mx.all(f32_sub).item())
+        self.assertTrue(mx.all(f16_sub).item())
+        self.assertTrue(mx.all(bf16_sub).item())
 
     def test_stop_gradient(self):
         def func(x):
@@ -2616,6 +2677,36 @@ class TestOps(mlx_tests.MLXTestCase):
         mem4 = mx.get_peak_memory()
         self.assertEqual(mem2, mem4)
 
+    def test_scan_size_one_axis(self):
+        # A size one axis can carry any stride and still be row contiguous, so
+        # the scan must not take its row count from that stride.
+        for op in ["cumsum", "cumprod", "cummax", "cummin"]:
+            for start in (1, 2, 3):
+                with self.subTest(op=op, start=start):
+                    base = mx.arange(1, 11, dtype=mx.float32).reshape(1, 10)
+                    a = base[:, start:]
+                    mx.eval(a)
+                    # The axis has size one, so an inclusive scan is the identity
+                    expected = np.array(a).copy()
+                    out = getattr(mx, op)(a, axis=0)
+                    self.assertTrue(np.array_equal(np.array(out), expected))
+
+    def test_scans_complex_exclusive(self):
+        a = mx.array([-3 + 1j, -1 + 2j, -4 + 0j, 0 + 5j, 2 - 1j])
+        for op in ("cummax", "cummin", "logcumsumexp"):
+            mxop = getattr(mx, op)
+            for reverse in (False, True):
+                inclusive = mxop(a, axis=0, inclusive=True, reverse=reverse)
+                exclusive = mxop(a, axis=0, inclusive=False, reverse=reverse)
+                if reverse:
+                    got, want = exclusive[:-1], inclusive[1:]
+                else:
+                    got, want = exclusive[1:], inclusive[:-1]
+                self.assertTrue(
+                    mx.allclose(got, want),
+                    msg=f"{op} reverse={reverse}",
+                )
+
     def test_cummax_cummin_nan(self):
         nan = float("nan")
         cases = [
@@ -3306,6 +3397,22 @@ class TestOps(mlx_tests.MLXTestCase):
                 self.assertTrue(
                     np.allclose(np_out[0], mx_out[0]), msg=f"Shapes {s1} {s2}, Type {t}"
                 )
+
+        # Mixed signs floor, matching python's divmod and numpy, so
+        # q * b + r == a holds
+        av = [-7, 7, -7, 7, -1, 1, -5, 5, 6, -6]
+        bv = [2, 2, -2, -2, 3, -3, 3, -3, 3, 3]
+        a, b = mx.array(av), mx.array(bv)
+        q, r = mx.divmod(a, b)
+        self.assertEqual(q.tolist(), [x // y for x, y in zip(av, bv)])
+        self.assertEqual(r.tolist(), [x % y for x, y in zip(av, bv)])
+        self.assertTrue(mx.array_equal(q * b + r, a))
+
+        af = mx.array([-7.0, 7.0, -7.5, 7.5])
+        bf = mx.array([2.0, -2.0, 2.0, -2.0])
+        q, r = mx.divmod(af, bf)
+        self.assertTrue(mx.array_equal(q, mx.array([-4.0, -4.0, -4.0, -4.0])))
+        self.assertTrue(mx.array_equal(q * bf + r, af))
 
     def test_tile(self):
         self.assertCmpNumpy([(2,), [2]], mx.tile, np.tile)
