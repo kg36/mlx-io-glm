@@ -207,11 +207,8 @@ template <
     for (short iq = 0; iq < TQ; iq++) {
       STEEL_PRAGMA_UNROLL
       for (short ik = 0; ik < TK; ik += 2) {
-        // Unrolling the head-dim loop by 4, rather than fully, potentially
-        // lets the compiler interleave the next K-tile loads with the running
-        // mma chain instead of hoisting all TD loads up front and is faster
-        // for head dim 128.
-#pragma clang loop unroll_count(4)
+        // Keep the full unroll used by LivSeek's qualified width-two path.
+        STEEL_PRAGMA_UNROLL
         for (short id = 0; id < TD; id++) {
           NAXTile<T, 1, 1> Qtile;
           NAXTile<T, 2, 1> Ktile;

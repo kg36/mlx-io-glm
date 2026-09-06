@@ -1308,6 +1308,11 @@ inline std::optional<GemvWideConfig> gemv_wide_config(
     int64_t vec_offset,
     const Strides& mat_batch_stride,
     const Strides& vec_batch_stride) {
+  // LivSeek's released trajectories were qualified with the pre-v0.32.1
+  // GEMV dispatch. The wide path changes BF16 rounding in short prefill
+  // projections, so retain the established path until it is requalified.
+  return std::nullopt;
+
   // Pre-M3 generations are limited by load issue rate rather than
   // bandwidth and do not profit from the amortized stream; they keep the
   // existing kernels.

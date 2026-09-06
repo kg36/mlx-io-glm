@@ -85,23 +85,8 @@ inline array ensure_row_contiguous_matrix(
 inline int get_qmv_batch_limit(int D, int O, metal::Device& d) {
   auto arch_size = d.get_architecture().back();
   auto arch_gen = d.get_architecture_gen();
-  if (arch_gen >= 17 && arch_size != 'd') {
-    if (D <= 2048 && O <= 2048) {
-      return 33;
-    } else if (D <= 4096 && O <= 4096) {
-      return 25;
-    } else {
-      return 13;
-    }
-  } else if (arch_gen >= 15 && arch_size != 'd') {
-    if (D <= 2048 && O <= 2048) {
-      return 13;
-    } else if (D <= 4096 && O <= 4096) {
-      return 15;
-    } else {
-      return 13;
-    }
-  } else if (arch_gen >= 13) {
+  // Retain the pre-v0.32.1 M5 dispatch used by LivSeek's qualified outputs.
+  if (arch_gen == 13 || arch_gen == 14) {
     switch (arch_size) {
       case 'd':
         if (D <= 2048 && O <= 2048) {
