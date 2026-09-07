@@ -38,6 +38,7 @@
 #include "mlx/expert_ssd_io_event.h"
 #include "mlx/io.h"
 #include "mlx/ops.h"
+#include "mlx/perfetto_trace.h"
 #include "mlx/utils.h"
 #include "python/src/convert.h"
 #include "python/src/load.h"
@@ -3394,6 +3395,51 @@ void init_ops(nb::module_& m) {
       nb::sig(
           "def _expert_ssd_mxfp4_masked_qmv(x: array, weight: array, scales: array, routes: array) -> array"));
   m.def(
+      "_perfetto_trace_start",
+      [](const std::string& output_path, size_t max_records) {
+        if (output_path.empty() || max_records == 0) {
+          throw std::invalid_argument(
+              "[_perfetto_trace_start] output_path and max_records required");
+        }
+        return mx::perfetto_trace::start(output_path, max_records);
+      },
+      "output_path"_a,
+      "max_records"_a,
+      nb::sig(
+          "def _perfetto_trace_start(output_path: str, max_records: int) -> int"),
+      R"pbdoc(
+        Begin a bounded native LivMLX trace. The returned timestamp uses the
+        native monotonic clock and is used to align Python and Metal events.
+      )pbdoc");
+  m.def(
+      "_perfetto_trace_stop",
+      []() { mx::perfetto_trace::stop(); },
+      nb::sig("def _perfetto_trace_stop() -> None"),
+      R"pbdoc(
+        Stop accepting new native LivMLX trace records without waiting for
+        already submitted SSD reads or Metal command buffers.
+      )pbdoc");
+  m.def(
+      "_perfetto_trace_finish",
+      [](size_t timeout_ms) {
+        mx::perfetto_trace::FinishResult result;
+        {
+          nb::gil_scoped_release release;
+          result = mx::perfetto_trace::finish(timeout_ms);
+        }
+        nb::dict out;
+        out["records"] = result.records;
+        out["dropped"] = result.dropped;
+        out["complete"] = result.complete;
+        return out;
+      },
+      "timeout_ms"_a = 5000,
+      nb::sig("def _perfetto_trace_finish(timeout_ms: int = 5000) -> dict"),
+      R"pbdoc(
+        Wait for in-flight native records, then write the native NDJSON
+        sidecar. File IO occurs only after capture has stopped.
+      )pbdoc");
+  m.def(
       "_expert_ssd_scalex_mxfp4_qmv",
       [](const mx::array& x,
          const mx::array& weight,
@@ -3410,6 +3456,13 @@ void init_ops(nb::module_& m) {
       "projection"_a,
       nb::sig(
           "def _expert_ssd_scalex_mxfp4_qmv(x: array, weight: array, scale_records: array, routes: array, projection: int) -> array"));
+  m.def(
+      "_expert_ssd_scalex_mxfp4_width2_pair_qmv",
+      [](const mx::array& x, const mx::array& up, const mx::array& gate,
+         const mx::array& records, const mx::array& routes) {
+        return mx::expert_ssd_scalex_mxfp4_width2_pair_qmv(x, up, gate, records, routes);
+      },
+      "x"_a, "up_weight"_a, "gate_weight"_a, "scale_records"_a, "routes"_a);
   m.def(
       "_expert_ssd_scalex_mxfp4_grouped_qmv",
       [](const mx::array& x,

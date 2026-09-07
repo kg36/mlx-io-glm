@@ -23,6 +23,7 @@
 #include "mlx/io.h"
 #include "mlx/io/load.h"
 #include "mlx/ops.h"
+#include "mlx/perfetto_trace.h"
 #include "mlx/primitives.h"
 #include "mlx/transforms.h"
 
@@ -879,6 +880,7 @@ void ScaleXModeADirect::load_expert_into(
     vectors[tensor + 1].iov_len = weight_destination_nbytes[tensor];
   }
   const size_t total_bytes = record.encoded_nbytes + weight_bytes;
+  perfetto_trace::ReadScope read_trace(0, expert_id, total_bytes);
   ssize_t result;
   do {
     result = ::preadv(
@@ -903,6 +905,7 @@ void ScaleXModeADirect::load_expert_into(
       offset += weight_destination_nbytes[tensor];
     }
   }
+  read_trace.finish();
   decode_scalex_mode_a_into(
       encoded, scale_destinations, scale_destination_nbytes);
 #endif
@@ -1034,6 +1037,7 @@ void ScaleXModeADirect::load_compressed_expert_slice_into_from(
   }
   const int source_fd = replica == 0 ? fd_ : replica_fd_;
   const size_t requested = logical_end - logical_begin;
+  perfetto_trace::ReadScope read_trace(replica, expert_id, requested);
   ssize_t result;
   do {
     result = ::preadv(
@@ -1170,6 +1174,7 @@ size_t ScaleXModeADirect::load_compressed_expert_chunk_into(
     }
     segment_start = segment_end;
   }
+  perfetto_trace::ReadScope read_trace(0, expert_id, requested);
   ssize_t result;
   do {
     result = ::preadv(
@@ -1192,6 +1197,7 @@ size_t ScaleXModeADirect::load_compressed_expert_chunk_into(
     }
   }
 
+  read_trace.finish();
   if (chunk_end == total_bytes) {
     const auto prefix_started = std::chrono::steady_clock::now();
     if (prefix_store_) {
@@ -1599,6 +1605,7 @@ void ExpertSafetensorsDirect::load_ordered_into(
       vectors[position].iov_base = destinations[tensor_index];
       vectors[position].iov_len = sizes[tensor_index];
     }
+    perfetto_trace::ReadScope read_trace(0, expert_id, range.byte_length);
     ssize_t result;
     do {
       result = ::preadv(

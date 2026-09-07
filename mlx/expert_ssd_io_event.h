@@ -123,6 +123,11 @@ MLX_API array expert_ssd_scalex_mxfp4_qmv(
     uint32_t projection,
     StreamOrDevice s = {});
 
+// Milan GLM: scalar groups (1..8 routes) or width-two/top-eight verifier.
+MLX_API std::vector<array> expert_ssd_scalex_mxfp4_width2_pair_qmv(
+    const array& x, const array& up_weight, const array& gate_weight,
+    const array& scale_records, const array& routes, StreamOrDevice s = {});
+
 // Wide-prompt peer for Gate/Up. ``x`` contains one row per token while
 // ``routes`` contains ``top_k`` physical expert rows per token. This keeps
 // compressed ScaleX records resident during prefill instead of hydrating a
