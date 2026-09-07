@@ -48,7 +48,7 @@ def get_version():
             .stdout.strip()
             .decode()
         )
-        version = f"{version}+{git_hash}"
+        version = f"{version}+{git_hash}.milan1"
 
     return version
 

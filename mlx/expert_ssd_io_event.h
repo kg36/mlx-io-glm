@@ -123,14 +123,22 @@ MLX_API array expert_ssd_scalex_mxfp4_qmv(
     uint32_t projection,
     StreamOrDevice s = {});
 
-// Fixed GLM width-two/top-eight Up+Gate companion. The two token rows and
-// both projections retain independent width-one QMV reductions in one launch.
+// Milan GLM: scalar groups (1..8 routes) or width-two/top-eight verifier.
 MLX_API std::vector<array> expert_ssd_scalex_mxfp4_width2_pair_qmv(
+    const array& x, const array& up_weight, const array& gate_weight,
+    const array& scale_records, const array& routes, StreamOrDevice s = {});
+
+// Wide-prompt peer for Gate/Up. ``x`` contains one row per token while
+// ``routes`` contains ``top_k`` physical expert rows per token. This keeps
+// compressed ScaleX records resident during prefill instead of hydrating a
+// second 256-row bank solely for gather_qmm.
+MLX_API array expert_ssd_scalex_mxfp4_grouped_qmv(
     const array& x,
-    const array& up_weight,
-    const array& gate_weight,
+    const array& weight,
     const array& scale_records,
     const array& routes,
+    uint32_t projection,
+    uint32_t top_k,
     StreamOrDevice s = {});
 
 // Bank-transparent peer of the fixed ScaleX QMV. Each route selects either
@@ -171,7 +179,7 @@ MLX_API array expert_ssd_scalex_mxfp4_qmv_split_routes_two_bank(
     uint32_t projection,
     StreamOrDevice s = {});
 
-// Fixed width-two/top-six-or-eight ScaleX Down QMV with exact BF16 route-score
+// Fixed width-two/top-six ScaleX Down QMV with exact BF16 route-score
 // reduction and shared-expert addition in the same Metal dispatch.
 MLX_API array expert_ssd_scalex_mxfp4_width2_down_reduce(
     const array& x,

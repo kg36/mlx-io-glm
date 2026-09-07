@@ -13,6 +13,7 @@
 
 #include "mlx/backend/common/utils.h"
 #include "mlx/backend/metal/device.h"
+#include "mlx/perfetto_trace.h"
 #include "mlx/backend/metal/event.h"
 #include "mlx/backend/metal/metal.h"
 #include "mlx/backend/metal/utils.h"
@@ -614,6 +615,29 @@ bool CommandEncoder::needs_commit() const {
 }
 
 void CommandEncoder::commit(std::function<void()> completion) {
+  const uint64_t trace_session = perfetto_trace::begin();
+  if (trace_session != 0) {
+    static std::atomic<uint64_t> next_trace_id{1};
+    const uint64_t trace_id =
+        next_trace_id.fetch_add(1, std::memory_order_relaxed);
+    const uint64_t commit_ns = perfetto_trace::clock_ns();
+    buffer_->addCompletedHandler(
+        [trace_session, trace_id, commit_ns](MTL::CommandBuffer* cb) {
+          perfetto_trace::State::instance().append(
+              trace_session,
+              {perfetto_trace::Kind::metal,
+               commit_ns,
+               static_cast<uint64_t>(cb->GPUStartTime() * 1e9),
+               static_cast<uint64_t>(cb->GPUEndTime() * 1e9),
+               perfetto_trace::thread_id(),
+               trace_id,
+               0,
+               0,
+               0,
+               0,
+               0});
+        });
+  }
   buffer_->addCompletedHandler(
       [&error_ = error_,
        wait_events = std::move(wait_events_),

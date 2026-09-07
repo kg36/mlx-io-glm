@@ -653,6 +653,60 @@ class ExpertSSDScaleXMXFP4Width2PairQMV : public Primitive {
   DEFINE_NAME(ExpertSSDScaleXMXFP4Width2PairQMV)
 };
 
+class ExpertSSDScaleXMXFP4GroupedQMV : public Primitive {
+ public:
+  ExpertSSDScaleXMXFP4GroupedQMV(
+      Stream stream,
+      uint32_t projection,
+      uint32_t top_k)
+      : Primitive(stream), projection_(projection), top_k_(top_k) {}
+
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+    throw std::runtime_error(
+        "[ExpertSSDScaleXMXFP4GroupedQMV] CPU evaluation not supported");
+  }
+
+  void eval_gpu(
+      const std::vector<array>& inputs,
+      std::vector<array>& outputs) override {
+    if (inputs.size() != 4 || outputs.size() != 1) {
+      throw std::runtime_error(
+          "[ExpertSSDScaleXMXFP4GroupedQMV] invalid input/output arity");
+    }
+    auto& output = outputs[0];
+    output.set_data(allocator::malloc(output.nbytes()));
+    const auto& x = inputs[0];
+    const auto& weight = inputs[1];
+    const auto& scale_records = inputs[2];
+    const auto& routes = inputs[3];
+    const int K = x.shape(-1);
+    const int N = weight.shape(-2);
+    const int record_stride = scale_records.shape(-1);
+    auto& d = metal::device(stream().device);
+    auto* kernel = d.get_kernel("dsv4_scalex_mxfp4_grouped_qmv_bf16");
+    auto& encoder = metal::get_command_encoder(stream());
+    encoder.set_compute_pipeline_state(kernel);
+    encoder.set_input_array(weight, 0);
+    encoder.set_input_array(scale_records, 1);
+    encoder.set_input_array(x, 2);
+    encoder.set_input_array(routes, 3);
+    encoder.set_output_array(output, 4);
+    encoder.set_bytes(K, 5);
+    encoder.set_bytes(N, 6);
+    encoder.set_bytes(record_stride, 7);
+    encoder.set_bytes(projection_, 8);
+    encoder.set_bytes(top_k_, 9);
+    encoder.dispatch_threadgroups(
+        MTL::Size(1, N / 8, routes.size()), MTL::Size(32, 2, 1));
+  }
+
+  DEFINE_NAME(ExpertSSDScaleXMXFP4GroupedQMV)
+
+ private:
+  uint32_t projection_;
+  uint32_t top_k_;
+};
+
 class ExpertSSDScaleXMXFP4QMVTwoBank : public Primitive {
  public:
   ExpertSSDScaleXMXFP4QMVTwoBank(Stream stream, uint32_t projection)
@@ -850,10 +904,11 @@ class ExpertSSDScaleXMXFP4FixedDownReduce : public Primitive {
     const int K = x.shape(-1);
     const int N = weight.shape(-2);
     const int record_stride = scale_records.shape(-1);
-    const uint32_t topk = static_cast<uint32_t>(weight_routes.size() / width_);
     auto& d = metal::device(stream().device);
     const char* kernel_name = width_ == 2
-        ? "dsv4_scalex_mxfp4_width2_down_reduce_bf16"
+        ? (weight_routes.size() == 16
+            ? "dsv4_scalex_mxfp4_glm_width2_down_reduce_bf16"
+            : "dsv4_scalex_mxfp4_width2_down_reduce_bf16")
         : "dsv4_scalex_mxfp4_width3_down_reduce_bf16";
     auto* kernel = d.get_kernel(kernel_name);
     auto& encoder = metal::get_command_encoder(stream());
@@ -869,7 +924,6 @@ class ExpertSSDScaleXMXFP4FixedDownReduce : public Primitive {
     encoder.set_bytes(K, 8);
     encoder.set_bytes(N, 9);
     encoder.set_bytes(record_stride, 10);
-    encoder.set_bytes(topk, 11);
     encoder.dispatch_threadgroups(
         MTL::Size(1, N / 8, width_), MTL::Size(32, 2, 1));
   }
@@ -913,7 +967,6 @@ class ExpertSSDScaleXMXFP4FixedDownReduceTwoBank : public Primitive {
     const int N = private_weight.shape(-2);
     const int private_record_stride = private_records.shape(-1);
     const int shared_record_stride = shared_records.shape(-1);
-    const uint32_t topk = static_cast<uint32_t>(weight_routes.size() / width_);
     auto& d = metal::device(stream().device);
     const char* kernel_name = width_ == 2
         ? "dsv4_scalex_mxfp4_width2_down_reduce_two_bank_bf16"
@@ -936,7 +989,6 @@ class ExpertSSDScaleXMXFP4FixedDownReduceTwoBank : public Primitive {
     encoder.set_bytes(N, 12);
     encoder.set_bytes(private_record_stride, 13);
     encoder.set_bytes(shared_record_stride, 14);
-    encoder.set_bytes(topk, 15);
     encoder.dispatch_threadgroups(
         MTL::Size(1, N / 8, width_), MTL::Size(32, 2, 1));
   }
@@ -1694,12 +1746,13 @@ std::vector<array> expert_ssd_scalex_mxfp4_width2_pair_qmv(
     StreamOrDevice s) {
   if (x.dtype() != bfloat16 || up_weight.dtype() != uint32 ||
       gate_weight.dtype() != uint32 || scale_records.dtype() != uint8 ||
-      routes.dtype() != uint32) {
+      (routes.dtype() != uint32 && routes.dtype() != int32)) {
     throw std::invalid_argument(
         "[expert_ssd_scalex_mxfp4_width2_pair_qmv] incompatible dtype");
   }
-  if (x.ndim() != 2 || x.shape(0) != 2 || x.shape(1) != 4096 ||
-      x.size() != 8192 || routes.ndim() != 1 || routes.size() != 16 ||
+  if (x.ndim() != 2 || (x.shape(0) != 1 && x.shape(0) != 2) || x.shape(1) != 4096 ||
+      routes.ndim() != 1 || routes.size() == 0 ||
+      (x.shape(0) == 1 ? routes.size() > 8 : routes.size() != 16) ||
       up_weight.ndim() != 3 || gate_weight.shape() != up_weight.shape() ||
       scale_records.ndim() != 2 ||
       up_weight.shape(0) != scale_records.shape(0) ||
@@ -1707,7 +1760,12 @@ std::vector<array> expert_ssd_scalex_mxfp4_width2_pair_qmv(
     throw std::invalid_argument(
         "[expert_ssd_scalex_mxfp4_width2_pair_qmv] unsupported GLM geometry");
   }
-  Shape output_shape{16, 1, 2048};
+  for (const auto* input : {&x, &up_weight, &gate_weight, &scale_records, &routes}) {
+    if (!input->flags().row_contiguous) {
+      throw std::invalid_argument("[expert_ssd_scalex_mxfp4_width2_pair_qmv] inputs must be row-contiguous");
+    }
+  }
+  Shape output_shape{static_cast<ShapeElem>(routes.size()), 1, 2048};
   auto primitive = std::make_shared<ExpertSSDScaleXMXFP4Width2PairQMV>(
       to_stream(s, Device::gpu));
   return array::make_arrays(
@@ -1715,6 +1773,46 @@ std::vector<array> expert_ssd_scalex_mxfp4_width2_pair_qmv(
       {bfloat16, bfloat16},
       primitive,
       {x, up_weight, gate_weight, scale_records, routes});
+}
+
+array expert_ssd_scalex_mxfp4_grouped_qmv(
+    const array& x,
+    const array& weight,
+    const array& scale_records,
+    const array& routes,
+    uint32_t projection,
+    uint32_t top_k,
+    StreamOrDevice s) {
+  if (x.dtype() != bfloat16 || weight.dtype() != uint32 ||
+      scale_records.dtype() != uint8 ||
+      (routes.dtype() != uint32 && routes.dtype() != int32) ||
+      (projection != 0 && projection != 2) || top_k == 0) {
+    throw std::invalid_argument(
+        "[expert_ssd_scalex_mxfp4_grouped_qmv] incompatible dtype or projection");
+  }
+  const auto input_rows = x.size() / x.shape(-1);
+  if (x.ndim() < 2 || x.size() % x.shape(-1) != 0 ||
+      routes.ndim() != 1 || routes.size() == 0 ||
+      routes.size() != input_rows * top_k || weight.ndim() != 3 ||
+      scale_records.ndim() != 2 ||
+      weight.shape(0) != scale_records.shape(0)) {
+    throw std::invalid_argument(
+        "[expert_ssd_scalex_mxfp4_grouped_qmv] invalid wide-prompt geometry");
+  }
+  const int K = x.shape(-1);
+  const int N = weight.shape(-2);
+  if (K != 4096 || N != 2048 || weight.shape(-1) * 8 != K) {
+    throw std::invalid_argument(
+        "[expert_ssd_scalex_mxfp4_grouped_qmv] unsupported target geometry");
+  }
+  Shape output_shape{static_cast<ShapeElem>(routes.size()), 1, N};
+  auto primitive = std::make_shared<ExpertSSDScaleXMXFP4GroupedQMV>(
+      to_stream(s, Device::gpu), projection, top_k);
+  return array::make_arrays(
+      {output_shape},
+      {bfloat16},
+      primitive,
+      {x, weight, scale_records, routes})[0];
 }
 
 array expert_ssd_scalex_mxfp4_qmv_two_bank(
@@ -1904,8 +2002,7 @@ static array expert_ssd_scalex_mxfp4_fixed_down_reduce_two_bank(
     StreamOrDevice s) {
   const bool route_dtype =
       weight_routes.dtype() == uint32 || weight_routes.dtype() == int32;
-  const int topk = static_cast<int>(weight_routes.size()) / width;
-  const int route_count = width * topk;
+  const int route_count = width * 6;
   if ((width != 2 && width != 3) || x.dtype() != bfloat16 ||
       private_weight.dtype() != uint32 || shared_weight.dtype() != uint32 ||
       private_scale_records.dtype() != uint8 ||
@@ -1915,11 +2012,6 @@ static array expert_ssd_scalex_mxfp4_fixed_down_reduce_two_bank(
       scores.dtype() != float32 || shared.dtype() != bfloat16) {
     throw std::invalid_argument(
         "[expert_ssd_scalex_mxfp4_fixed_down_reduce_two_bank] incompatible dtype");
-  }
-  if ((width == 2 && topk != 6 && topk != 8) ||
-      (width == 3 && topk != 6)) {
-    throw std::invalid_argument(
-        "[expert_ssd_scalex_mxfp4_fixed_down_reduce_two_bank] unsupported top-k");
   }
   if (x.ndim() < 2 || x.shape(-2) != 1 || x.shape(-1) != 2048 ||
       x.size() != route_count * 2048 || private_weight.ndim() != 3 ||
