@@ -448,6 +448,24 @@ class ExpertSSDCacheState {
     reservations_.erase(iterator);
   }
 
+  uint64_t pin_identity_rows() {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    require_private_api();
+    const auto& state = layers_.front();
+    if (state.capacity != expert_count_) {
+      throw std::invalid_argument("ExpertSSD identity pin requires a full resident bank");
+    }
+    std::vector<int64_t> experts;
+    for (size_t expert = 0; expert < expert_count_; ++expert) {
+      if (state.expert_to_row[expert] != static_cast<int32_t>(expert) ||
+          state.down_expert_to_row[expert] != static_cast<int32_t>(expert)) {
+        throw std::invalid_argument("ExpertSSD identity rows are not loaded");
+      }
+      experts.push_back(expert);
+    }
+    return reserve(0, experts);
+  }
+
   nb::dict reservation_metadata() const {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     nb::dict output;
@@ -2726,6 +2744,10 @@ void init_ops(nb::module_& m) {
     if (!state) throw std::invalid_argument("ExpertSSD state is required");
     state->release(reservation);
   }, "state"_a, "reservation"_a);
+  m.def("_expert_ssd_cache_pin_identity", [](std::shared_ptr<ExpertSSDCacheState> state) {
+    if (!state) throw std::invalid_argument("ExpertSSD state is required");
+    return state->pin_identity_rows();
+  }, "state"_a);
   m.def("_expert_ssd_cache_reservations", [](std::shared_ptr<ExpertSSDCacheState> state) {
     if (!state) throw std::invalid_argument("ExpertSSD state is required");
     return state->reservation_metadata();
