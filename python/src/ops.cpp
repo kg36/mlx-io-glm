@@ -1194,7 +1194,173 @@ class ExpertSSDCacheState {
     return output;
   }
 
+  nb::dict snapshot() const {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    require_identity();
+    require_quiescent();
+    if (shared_lease_active_) {
+      throw std::invalid_argument("ExpertSSD cannot snapshot a prefill lease");
+    }
+    nb::dict output;
+    output["version"] = 1;
+    output["role"] = role_;
+    output["layers"] = logical_layers_;
+    output["private_mode"] = legacy_private_;
+    output["parameters"] = snapshot_parameters();
+    nb::list owners;
+    for (const auto& state : layers_) {
+      nb::dict entry;
+      entry["gate_up"] = state.expert_to_row;
+      entry["down"] = state.down_expert_to_row;
+      entry["free_gate_up"] = state.free_rows;
+      entry["free_down"] = state.free_down_rows;
+      entry["retention"] = state.legacy_retention;
+      owners.append(entry);
+    }
+    output["ownership"] = owners;
+    output["shared_rows"] = shared_rows_;
+    output["free_shared"] = shared_free_rows_;
+    const auto policy = serialize_policy();
+    output["policy"] = nb::bytes(policy.data(), policy.size());
+    return output;
+  }
+
+  void validate_snapshot(const nb::dict& saved, bool for_restore = false) const {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (for_restore) require_cold_snapshot();
+    (void)parse_snapshot(saved);
+  }
+
+  void restore_snapshot(const nb::dict& saved) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    require_cold_snapshot();
+    auto parsed = parse_snapshot(saved);
+    restore_policy_snapshot(parsed.policy);
+    for (size_t index = 0; index < layers_.size(); ++index) {
+      auto& state = layers_[index];
+      auto& rows = parsed.owners[index];
+      state.expert_to_row = std::move(rows.gate_up);
+      state.down_expert_to_row = std::move(rows.down);
+      state.free_rows = std::move(rows.free_gate_up);
+      state.free_down_rows = std::move(rows.free_down);
+      state.legacy_retention = std::move(rows.retention);
+    }
+    shared_rows_ = std::move(parsed.shared_rows);
+    shared_free_rows_ = std::move(parsed.free_shared);
+  }
+
  private:
+  void require_cold_snapshot() const {
+    require_quiescent();
+    if (shared_lease_active_ || hits_ || misses_ || evictions_ || serial_) {
+      throw std::invalid_argument("ExpertSSD snapshot restore requires cold state");
+    }
+    for (const auto& state : layers_) {
+      if (std::any_of(state.expert_to_row.begin(), state.expert_to_row.end(),
+                      [](int32_t row) { return row >= 0; })) {
+        throw std::invalid_argument("ExpertSSD snapshot restore requires empty rows");
+      }
+    }
+    if (std::any_of(shared_rows_.begin(), shared_rows_.end(),
+                    [](int32_t row) { return row >= 0; })) {
+      throw std::invalid_argument("ExpertSSD snapshot restore requires empty shared rows");
+    }
+  }
+
+  struct SavedOwnership {
+    std::vector<int32_t> gate_up, down, free_gate_up, free_down;
+    std::vector<double> retention;
+  };
+
+  struct SavedState {
+    std::vector<SavedOwnership> owners;
+    std::vector<int32_t> shared_rows, free_shared;
+    std::string policy;
+  };
+
+  std::vector<double> snapshot_parameters() const {
+    return {retention_decay_, interval_alpha_, initial_interval_, age_weight_,
+            deadline_weight_, markov_boost_, static_cast<double>(markov_history_),
+            miss_pressure_alpha_, miss_pressure_weight_};
+  }
+
+  static void validate_row_partition(
+      const std::vector<int32_t>& rows, const std::vector<int32_t>& free,
+      size_t capacity) {
+    std::vector<bool> used(capacity, false);
+    size_t count = 0;
+    for (const auto row : rows) {
+      if (row == -1) continue;
+      if (row < 0 || static_cast<size_t>(row) >= capacity || used[row]) {
+        throw std::invalid_argument("ExpertSSD snapshot has invalid row ownership");
+      }
+      used[row] = true;
+      ++count;
+    }
+    for (const auto row : free) {
+      if (row < 0 || static_cast<size_t>(row) >= capacity || used[row]) {
+        throw std::invalid_argument("ExpertSSD snapshot has invalid free rows");
+      }
+      used[row] = true;
+      ++count;
+    }
+    if (count != capacity) {
+      throw std::invalid_argument("ExpertSSD snapshot loses physical rows");
+    }
+  }
+
+  SavedState parse_snapshot(const nb::dict& saved) const {
+    require_identity();
+    if (nb::cast<int>(saved["version"]) != 1 ||
+        nb::cast<std::string>(saved["role"]) != role_ ||
+        nb::cast<std::vector<int64_t>>(saved["layers"]) != logical_layers_ ||
+        nb::cast<bool>(saved["private_mode"]) != legacy_private_ ||
+        nb::cast<std::vector<double>>(saved["parameters"]) != snapshot_parameters()) {
+      throw std::invalid_argument("ExpertSSD snapshot identity or policy differs");
+    }
+    const auto policy = nb::cast<nb::bytes>(saved["policy"]);
+    SavedState output;
+    output.policy.assign(policy.c_str(), policy.size());
+    (void)parse_policy_snapshot(output.policy);
+    const auto owners = nb::cast<nb::list>(saved["ownership"]);
+    if (owners.size() != layers_.size()) {
+      throw std::invalid_argument("ExpertSSD snapshot layer count differs");
+    }
+    output.shared_rows = nb::cast<std::vector<int32_t>>(saved["shared_rows"]);
+    output.free_shared = nb::cast<std::vector<int32_t>>(saved["free_shared"]);
+    if (output.shared_rows.size() != layers_.size() * expert_count_) {
+      throw std::invalid_argument("ExpertSSD snapshot shared geometry differs");
+    }
+    validate_row_partition(output.shared_rows, output.free_shared, shared_capacity_);
+    for (size_t index = 0; index < layers_.size(); ++index) {
+      const auto entry = nb::cast<nb::dict>(owners[index]);
+      SavedOwnership rows{
+          nb::cast<std::vector<int32_t>>(entry["gate_up"]),
+          nb::cast<std::vector<int32_t>>(entry["down"]),
+          nb::cast<std::vector<int32_t>>(entry["free_gate_up"]),
+          nb::cast<std::vector<int32_t>>(entry["free_down"]),
+          nb::cast<std::vector<double>>(entry["retention"])};
+      if (rows.gate_up.size() != expert_count_ ||
+          rows.down.size() != (legacy_private_ ? expert_count_ : 0) ||
+          rows.retention.size() != rows.down.size() ||
+          std::any_of(rows.retention.begin(), rows.retention.end(),
+                      [](double value) { return !std::isfinite(value); })) {
+        throw std::invalid_argument("ExpertSSD snapshot projection geometry differs");
+      }
+      validate_row_partition(rows.gate_up, rows.free_gate_up, layers_[index].capacity);
+      validate_row_partition(rows.down, rows.free_down, legacy_private_ ? layers_[index].capacity : 0);
+      for (size_t expert = 0; expert < expert_count_; ++expert) {
+        const bool resident = rows.gate_up[expert] >= 0;
+        if ((resident && output.shared_rows[key(index, expert)] >= 0) ||
+            (legacy_private_ && resident != (rows.down[expert] >= 0))) {
+          throw std::invalid_argument("ExpertSSD snapshot projection ownership differs");
+        }
+      }
+      output.owners.push_back(std::move(rows));
+    }
+    return output;
+  }
+
   struct SavedLayerPolicy {
     int64_t clock{0};
     double demand_scale{1.0};
@@ -2564,6 +2730,18 @@ void init_ops(nb::module_& m) {
     if (!state) throw std::invalid_argument("ExpertSSD state is required");
     return state->reservation_metadata();
   }, "state"_a);
+  m.def("_expert_ssd_cache_snapshot", [](std::shared_ptr<ExpertSSDCacheState> state) {
+    if (!state) throw std::invalid_argument("ExpertSSD state is required");
+    return state->snapshot();
+  }, "state"_a);
+  m.def("_expert_ssd_cache_snapshot_validate", [](std::shared_ptr<ExpertSSDCacheState> state, nb::dict snapshot, bool for_restore) {
+    if (!state) throw std::invalid_argument("ExpertSSD state is required");
+    state->validate_snapshot(snapshot, for_restore);
+  }, "state"_a, "snapshot"_a, "for_restore"_a = false);
+  m.def("_expert_ssd_cache_snapshot_restore", [](std::shared_ptr<ExpertSSDCacheState> state, nb::dict snapshot) {
+    if (!state) throw std::invalid_argument("ExpertSSD state is required");
+    state->restore_snapshot(snapshot);
+  }, "state"_a, "snapshot"_a);
   m.def(
       "_expert_ssd_internal_stripe_bytes",
       [](size_t total, double ratio) {
