@@ -2511,6 +2511,27 @@ void scalex_two_bank_batch_run(void* raw) {
   mx::expert_ssd_io_event_signal(state->event_state, state->event_value);
 }
 
+template <typename State>
+void expert_ssd_async_wait(const std::shared_ptr<State>& state) {
+  {
+    std::lock_guard<std::mutex> lock(state->completion_mutex);
+    if (state->complete) {
+      std::lock_guard<std::mutex> error_lock(state->error_mutex);
+      if (state->error) std::rethrow_exception(state->error);
+      return;
+    }
+  }
+  std::exception_ptr error;
+  {
+    nb::gil_scoped_release release;
+    std::unique_lock<std::mutex> lock(state->completion_mutex);
+    state->completion_condition.wait(lock, [&]() { return state->complete; });
+    std::lock_guard<std::mutex> error_lock(state->error_mutex);
+    error = state->error;
+  }
+  if (error) std::rethrow_exception(error);
+}
+
 void init_ops(nb::module_& m) {
   m.def("_scalex_mode_b_async_trace", &scalex_read_trace<ExpertSSDAsyncBatchState>);
   m.def("_scalex_mode_b_two_bank_async_trace",
@@ -4308,18 +4329,7 @@ void init_ops(nb::module_& m) {
           throw std::invalid_argument(
               "[_scalex_mode_a_async_wait] state required");
         }
-        std::exception_ptr error;
-        {
-          nb::gil_scoped_release release;
-          std::unique_lock<std::mutex> lock(state->completion_mutex);
-          state->completion_condition.wait(
-              lock, [&]() { return state->complete; });
-          std::lock_guard<std::mutex> error_lock(state->error_mutex);
-          error = state->error;
-        }
-        if (error) {
-          std::rethrow_exception(error);
-        }
+        expert_ssd_async_wait(state);
       },
       "state"_a,
       nb::sig(
@@ -4651,18 +4661,7 @@ void init_ops(nb::module_& m) {
           throw std::invalid_argument(
               "[_scalex_mode_b_async_wait] state required");
         }
-        std::exception_ptr error;
-        {
-          nb::gil_scoped_release release;
-          std::unique_lock<std::mutex> lock(state->completion_mutex);
-          state->completion_condition.wait(
-              lock, [&]() { return state->complete; });
-          std::lock_guard<std::mutex> error_lock(state->error_mutex);
-          error = state->error;
-        }
-        if (error) {
-          std::rethrow_exception(error);
-        }
+        expert_ssd_async_wait(state);
       },
       "state"_a,
       nb::sig(
@@ -4814,18 +4813,7 @@ void init_ops(nb::module_& m) {
           throw std::invalid_argument(
               "[_scalex_mode_b_two_bank_async_wait] state required");
         }
-        std::exception_ptr error;
-        {
-          nb::gil_scoped_release release;
-          std::unique_lock<std::mutex> lock(state->completion_mutex);
-          state->completion_condition.wait(
-              lock, [&]() { return state->complete; });
-          std::lock_guard<std::mutex> error_lock(state->error_mutex);
-          error = state->error;
-        }
-        if (error) {
-          std::rethrow_exception(error);
-        }
+        expert_ssd_async_wait(state);
       },
       "state"_a,
       nb::sig(
