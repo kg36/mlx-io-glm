@@ -218,6 +218,7 @@ class ExpertSSDMarkovState {
 };
 
 struct ExpertSSDRouteCachePlan {
+  uint64_t reservation{0};
   std::vector<int64_t> routed;
   std::vector<int64_t> unique;
   std::vector<int32_t> counts;
@@ -235,6 +236,7 @@ struct ExpertSSDRouteCachePlan {
 
 
 struct ExpertSSDGlobalPoolPlan {
+  uint64_t reservation{0};
   std::vector<int64_t> routed;
   std::vector<int64_t> unique;
   std::vector<int32_t> counts;
@@ -342,6 +344,7 @@ class ExpertSSDCacheState {
       layers_.push_back(std::move(state));
     }
     const auto key_count = layers_.size() * expert_count_;
+    reserved_keys_.assign(key_count, 0);
     shared_rows_.assign(key_count, -1);
     retention_.assign(key_count, 0.0);
     last_access_.assign(key_count, 0);
@@ -352,8 +355,11 @@ class ExpertSSDCacheState {
 
   ExpertSSDRouteCachePlan plan(
       const mx::array& indices,
-      const std::vector<uint8_t>& active_mask = {}) {
+      const std::vector<uint8_t>& active_mask = {},
+      bool reserve_rows = false) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     require_private_api();
+    if (reserve_rows) require_identity();
     const auto selected = plan(0, indices, active_mask);
     auto& state = layers_.front();
     for (const auto expert : selected.evicted_experts) {
@@ -391,6 +397,71 @@ class ExpertSSDCacheState {
     for (const auto expert : selected.missing) {
       output.missing_down_rows.push_back(state.down_expert_to_row[expert]);
     }
+    if (reserve_rows) output.reservation = reserve(0, selected.unique);
+    return output;
+  }
+
+  void set_identity(const std::string& role, const std::vector<int64_t>& layers) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (role.empty() || layers.size() != layers_.size() || !role_.empty() || serial_ != 0) {
+      throw std::invalid_argument("ExpertSSD identity must be set once before use");
+    }
+    std::unordered_set<int64_t> unique;
+    for (size_t i = 0; i < layers.size(); ++i) {
+      if (layers[i] < 0 || !unique.insert(layers[i]).second ||
+          (!legacy_private_ && layers[i] != layers_[i].layer)) {
+        throw std::invalid_argument("ExpertSSD identity layer geometry mismatch");
+      }
+    }
+    role_ = role;
+    logical_layers_ = layers;
+  }
+
+  uint64_t reserve(int64_t layer, const std::vector<int64_t>& experts) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    require_identity();
+    const auto& state = layer_state(layer);
+    const auto index = layer_lookup_.at(layer);
+    std::unordered_set<size_t> keys;
+    for (const auto expert : experts) {
+      validate_expert(expert);
+      const auto resident_key = key(index, expert);
+      if (state.expert_to_row[expert] < 0 && shared_rows_[resident_key] < 0) {
+        throw std::invalid_argument("ExpertSSD cannot reserve an absent expert");
+      }
+      keys.insert(resident_key);
+    }
+    if (keys.empty()) throw std::invalid_argument("ExpertSSD reservation is empty");
+    const auto ticket = ++next_reservation_;
+    reservations_.emplace(ticket, std::vector<size_t>(keys.begin(), keys.end()));
+    for (const auto resident_key : keys) ++reserved_keys_[resident_key];
+    return ticket;
+  }
+
+  void release(uint64_t ticket) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    const auto iterator = reservations_.find(ticket);
+    if (iterator == reservations_.end()) {
+      throw std::invalid_argument("ExpertSSD reservation is foreign or released");
+    }
+    for (const auto resident_key : iterator->second) --reserved_keys_[resident_key];
+    reservations_.erase(iterator);
+  }
+
+  nb::dict reservation_metadata() const {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    nb::dict output;
+    output["role"] = role_;
+    output["layers"] = logical_layers_;
+    output["transactions"] = reservations_.size();
+    nb::list rows;
+    for (size_t index = 0; index < reserved_keys_.size(); ++index) {
+      if (reserved_keys_[index]) {
+        rows.append(nb::make_tuple(role_, logical_layers_[index / expert_count_],
+                                   index % expert_count_, reserved_keys_[index]));
+      }
+    }
+    output["readers"] = rows;
     return output;
   }
 
@@ -414,6 +485,8 @@ class ExpertSSDCacheState {
       const std::vector<double>& demand,
       const std::vector<int64_t>& last_seen,
       const std::vector<double>& interval_ema) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    require_quiescent();
     require_private_api();
     auto restored = layers_.front();
     if (expert_slots.size() > restored.capacity ||
@@ -470,6 +543,7 @@ class ExpertSSDCacheState {
   }
 
   nb::dict legacy_metadata() const {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     require_private_api();
     const auto& state = layers_.front();
     std::vector<int64_t> ordered;
@@ -506,7 +580,10 @@ class ExpertSSDCacheState {
 
   ExpertSSDGlobalPoolPlan plan(
       int64_t layer, const mx::array& indices,
-      const std::vector<uint8_t>& active_mask = {}) {
+      const std::vector<uint8_t>& active_mask = {},
+      bool reserve_rows = false) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (reserve_rows) require_identity();
     if (shared_lease_active_) {
       throw std::invalid_argument(
           "ExpertSSD global-pool cannot plan while shared rows are leased");
@@ -567,6 +644,27 @@ class ExpertSSDCacheState {
     const auto& demand_counts = active_mask.empty() ? output.counts : active_counts;
     if (demand_unique.empty()) {
       throw std::invalid_argument("ExpertSSD route must have an active expert");
+    }
+    if (!reservations_.empty()) {
+      size_t available = state.free_rows.size() + shared_free_rows_.size();
+      size_t missing = 0;
+      for (size_t expert = 0; expert < expert_count_; ++expert) {
+        if (state.expert_to_row[expert] >= 0 && !protected_experts[expert] &&
+            !reserved_keys_[key(layer_index, expert)]) ++available;
+      }
+      for (size_t index = 0; index < layers_.size(); ++index) {
+        for (size_t expert = 0; expert < expert_count_; ++expert) {
+          const auto resident_key = key(index, expert);
+          if (shared_rows_[resident_key] >= 0 && !reserved_keys_[resident_key] &&
+              !(index == layer_index && protected_experts[expert])) ++available;
+        }
+      }
+      for (const auto expert : demand_unique) {
+        if (state.expert_to_row[expert] < 0 && shared_rows_[key(layer_index, expert)] < 0) ++missing;
+      }
+      if (missing > available) {
+        throw std::invalid_argument("ExpertSSD capacity is held by in-flight reservations");
+      }
     }
     ++state.call_index;
     decay_retention(state);
@@ -648,10 +746,12 @@ class ExpertSSDCacheState {
         (1.0 - miss_pressure_alpha_) * state.miss_pressure;
     hits_ += output.hits;
     misses_ += output.misses;
+    if (reserve_rows) output.reservation = reserve(layer, output.unique);
     return output;
   }
 
   size_t try_all_hit(int64_t layer, const mx::array& indices) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     auto& state = layer_state(layer);
     const auto layer_index = layer_lookup_.at(layer);
     std::vector<int64_t> routed;
@@ -687,6 +787,7 @@ class ExpertSSDCacheState {
   void replay_all_hit_route(
       int64_t layer,
       const std::vector<int64_t>& routed) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (shared_lease_active_) {
       throw std::invalid_argument(
           "ExpertSSD global-pool cannot replay while shared rows are leased");
@@ -750,6 +851,8 @@ class ExpertSSDCacheState {
   void restore_rows(
       const std::vector<std::vector<int64_t>>& private_assignments,
       const std::vector<std::vector<int64_t>>& shared_assignments) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    require_quiescent();
     if (hits_ != 0 || misses_ != 0 || evictions_ != 0) {
       throw std::invalid_argument(
           "ExpertSSD global-pool restore requires unused state");
@@ -854,6 +957,8 @@ class ExpertSSDCacheState {
   }
 
   void lease_shared_rows() {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    require_quiescent();
     if (shared_lease_active_) {
       throw std::invalid_argument(
           "ExpertSSD global-pool shared rows are already leased");
@@ -870,6 +975,8 @@ class ExpertSSDCacheState {
 
   void restore_leased_shared_rows(
       const std::vector<std::vector<int64_t>>& shared_assignments) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    require_quiescent();
     if (!shared_lease_active_) {
       throw std::invalid_argument(
           "ExpertSSD global-pool shared rows are not leased");
@@ -941,6 +1048,8 @@ class ExpertSSDCacheState {
       const std::vector<int64_t>& last_seen,
       const std::vector<double>& interval_ema,
       const std::string& markov_payload) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    require_quiescent();
     if (hits_ != 0 || misses_ != 0 || evictions_ != 0 || clock < 0 ||
         !std::isfinite(demand_scale) || demand_scale <= 0.0 ||
         demand.size() != expert_count_ || last_seen.size() != expert_count_ ||
@@ -984,6 +1093,8 @@ class ExpertSSDCacheState {
   }
 
   std::string serialize_policy() const {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    require_quiescent();
     std::string output("DSGP1", 5);
     append_policy(output, static_cast<uint32_t>(expert_count_));
     append_policy(output, static_cast<uint32_t>(layers_.size()));
@@ -1015,6 +1126,8 @@ class ExpertSSDCacheState {
   }
 
   void restore_policy_snapshot(const std::string& payload) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    require_quiescent();
     if (hits_ != 0 || misses_ != 0 || evictions_ != 0) {
       throw std::invalid_argument(
           "ExpertSSD global-pool exact policy restore requires unused state");
@@ -1040,6 +1153,7 @@ class ExpertSSDCacheState {
   }
 
   nb::dict metadata() const {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     nb::dict output;
     nb::list layer_entries;
     for (size_t layer_index = 0; layer_index < layers_.size(); ++layer_index) {
@@ -1285,6 +1399,14 @@ class ExpertSSDCacheState {
     }
   }
 
+  void require_identity() const {
+    if (role_.empty()) throw std::invalid_argument("ExpertSSD reservation requires a role/layer identity");
+  }
+
+  void require_quiescent() const {
+    if (!reservations_.empty()) throw std::invalid_argument("ExpertSSD has in-flight reservations");
+  }
+
   LayerState& layer_state(int64_t layer) {
     const auto iterator = layer_lookup_.find(layer);
     if (iterator == layer_lookup_.end()) {
@@ -1478,7 +1600,8 @@ class ExpertSSDCacheState {
       const std::vector<uint8_t>& protected_experts) const {
     Victim best;
     for (size_t expert = 0; expert < expert_count_; ++expert) {
-      if (state.expert_to_row[expert] < 0 || protected_experts[expert]) {
+      if (state.expert_to_row[expert] < 0 || protected_experts[expert] ||
+          reserved_keys_[key(layer_index, expert)]) {
         continue;
       }
       Victim candidate{
@@ -1497,6 +1620,7 @@ class ExpertSSDCacheState {
     for (size_t layer_index = 0; layer_index < layers_.size(); ++layer_index) {
       for (size_t expert = 0; expert < expert_count_; ++expert) {
         if (shared_rows_[key(layer_index, expert)] < 0 ||
+            reserved_keys_[key(layer_index, expert)] ||
             (layer_index == requesting_layer_index &&
              protected_experts[expert])) {
           continue;
@@ -1532,6 +1656,12 @@ class ExpertSSDCacheState {
   }
 
   size_t expert_count_;
+  mutable std::recursive_mutex mutex_;
+  std::string role_;
+  std::vector<int64_t> logical_layers_;
+  std::vector<size_t> reserved_keys_;
+  std::unordered_map<uint64_t, std::vector<size_t>> reservations_;
+  inline static std::atomic<uint64_t> next_reservation_{0};
   size_t shared_capacity_;
   double retention_decay_;
   double interval_alpha_;
@@ -2400,6 +2530,19 @@ void init_ops(nb::module_& m) {
   nb::class_<ExpertSSDCacheState>(m, "_ExpertSSDCacheState");
   m.attr("_ExpertSSDRouteCacheState") = m.attr("_ExpertSSDCacheState");
   m.attr("_ExpertSSDGlobalPoolState") = m.attr("_ExpertSSDCacheState");
+  m.def("_expert_ssd_cache_set_identity", [](std::shared_ptr<ExpertSSDCacheState> state,
+                                           const std::string& role, const std::vector<int64_t>& layers) {
+    if (!state) throw std::invalid_argument("ExpertSSD state is required");
+    state->set_identity(role, layers);
+  }, "state"_a, "role"_a, "layers"_a);
+  m.def("_expert_ssd_cache_release", [](std::shared_ptr<ExpertSSDCacheState> state, uint64_t reservation) {
+    if (!state) throw std::invalid_argument("ExpertSSD state is required");
+    state->release(reservation);
+  }, "state"_a, "reservation"_a);
+  m.def("_expert_ssd_cache_reservations", [](std::shared_ptr<ExpertSSDCacheState> state) {
+    if (!state) throw std::invalid_argument("ExpertSSD state is required");
+    return state->reservation_metadata();
+  }, "state"_a);
   m.def(
       "_expert_ssd_internal_stripe_bytes",
       [](size_t total, double ratio) {
@@ -2538,7 +2681,7 @@ void init_ops(nb::module_& m) {
   m.def(
       "_expert_ssd_route_cache_plan",
       [](std::shared_ptr<ExpertSSDRouteCacheState> state, mx::array indices,
-         const std::vector<uint8_t>& active_mask) {
+         const std::vector<uint8_t>& active_mask, bool reserve) {
         if (!state || indices.ndim() == 0) {
           throw std::invalid_argument(
               "ExpertSSD route-cache state and routed indices are required");
@@ -2556,7 +2699,7 @@ void init_ops(nb::module_& m) {
           // persistent native cache transaction mutates its policy state.
           nb::gil_scoped_release release;
           indices.eval();
-          plan = state->plan(indices, active_mask);
+          plan = state->plan(indices, active_mask, reserve);
         }
         nb::dict output;
         nb::list unique;
@@ -2597,6 +2740,7 @@ void init_ops(nb::module_& m) {
             plan.compact.begin(), indices.shape(), indices.dtype());
         output["gate_up_rows"] = gate_up_rows;
         output["down_rows"] = down_rows;
+        if (reserve) output["reservation"] = plan.reservation;
         output["resident_before"] = resident_before;
         output["missing"] = missing;
         output["missing_gate_up_rows"] = missing_gate_up_rows;
@@ -2609,8 +2753,9 @@ void init_ops(nb::module_& m) {
       "state"_a,
       "indices"_a,
       "active_mask"_a = std::vector<uint8_t>{},
+      "reserve"_a = false,
       nb::sig(
-          "def _expert_ssd_route_cache_plan(state: _ExpertSSDRouteCacheState, indices: array, active_mask: list[int] = []) -> dict"));
+          "def _expert_ssd_route_cache_plan(state: _ExpertSSDRouteCacheState, indices: array, active_mask: list[int] = [], reserve: bool = False) -> dict"));
   m.def(
       "_expert_ssd_route_cache_replay_all_hits",
       [](std::shared_ptr<ExpertSSDRouteCacheState> state,
@@ -2697,7 +2842,7 @@ void init_ops(nb::module_& m) {
       [](std::shared_ptr<ExpertSSDGlobalPoolState> state,
          int64_t layer,
          mx::array indices,
-         const std::vector<uint8_t>& active_mask) {
+         const std::vector<uint8_t>& active_mask, bool reserve) {
         if (!state || indices.ndim() == 0) {
           throw std::invalid_argument(
               "ExpertSSD global-pool state and routed indices are required");
@@ -2712,7 +2857,7 @@ void init_ops(nb::module_& m) {
         {
           nb::gil_scoped_release release;
           indices.eval();
-          plan = state->plan(layer, indices, active_mask);
+          plan = state->plan(layer, indices, active_mask, reserve);
         }
         nb::dict output;
         nb::list unique;
@@ -2752,6 +2897,7 @@ void init_ops(nb::module_& m) {
         output["compact"] = mx::array(
             plan.compact.begin(), indices.shape(), indices.dtype());
         output["shared_bank"] = shared_bank;
+        if (reserve) output["reservation"] = plan.reservation;
         output["rows"] = rows;
         output["resident_before"] = resident_before;
         output["missing"] = missing;
@@ -2766,8 +2912,9 @@ void init_ops(nb::module_& m) {
       "layer"_a,
       "indices"_a,
       "active_mask"_a = std::vector<uint8_t>{},
+      "reserve"_a = false,
       nb::sig(
-          "def _expert_ssd_global_pool_plan(state: _ExpertSSDGlobalPoolState, layer: int, indices: array, active_mask: list[int] = []) -> dict"));
+          "def _expert_ssd_global_pool_plan(state: _ExpertSSDGlobalPoolState, layer: int, indices: array, active_mask: list[int] = [], reserve: bool = False) -> dict"));
   m.def(
       "_expert_ssd_global_pool_replay_all_hit",
       [](std::shared_ptr<ExpertSSDGlobalPoolState> state,
