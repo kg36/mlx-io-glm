@@ -451,6 +451,9 @@ class ExpertSSDCacheState {
   uint64_t pin_identity_rows() {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     require_private_api();
+    if (shared_lease_active_) {
+      throw std::invalid_argument("ExpertSSD identity rows are leased for prefill");
+    }
     const auto& state = layers_.front();
     if (state.capacity != expert_count_) {
       throw std::invalid_argument("ExpertSSD identity pin requires a full resident bank");
@@ -464,6 +467,21 @@ class ExpertSSDCacheState {
       experts.push_back(expert);
     }
     return reserve(0, experts);
+  }
+
+  void begin_private_prefill() {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    require_private_api();
+    require_identity();
+    // The zero-shared-capacity lease protects private ownership and policy
+    // without clearing it. The donor must be restored before the lease ends.
+    lease_shared_rows();
+  }
+
+  void end_private_prefill() {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    require_private_api();
+    restore_leased_shared_rows({});
   }
 
   nb::dict reservation_metadata() const {
@@ -2747,6 +2765,14 @@ void init_ops(nb::module_& m) {
   m.def("_expert_ssd_cache_pin_identity", [](std::shared_ptr<ExpertSSDCacheState> state) {
     if (!state) throw std::invalid_argument("ExpertSSD state is required");
     return state->pin_identity_rows();
+  }, "state"_a);
+  m.def("_expert_ssd_cache_begin_private_prefill", [](std::shared_ptr<ExpertSSDCacheState> state) {
+    if (!state) throw std::invalid_argument("ExpertSSD state is required");
+    state->begin_private_prefill();
+  }, "state"_a);
+  m.def("_expert_ssd_cache_end_private_prefill", [](std::shared_ptr<ExpertSSDCacheState> state) {
+    if (!state) throw std::invalid_argument("ExpertSSD state is required");
+    state->end_private_prefill();
   }, "state"_a);
   m.def("_expert_ssd_cache_reservations", [](std::shared_ptr<ExpertSSDCacheState> state) {
     if (!state) throw std::invalid_argument("ExpertSSD state is required");
