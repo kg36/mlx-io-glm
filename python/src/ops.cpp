@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdlib>
@@ -13,6 +14,7 @@
 #include <memory>
 #include <mutex>
 #include <numeric>
+#include <optional>
 #include <ostream>
 #include <sstream>
 #include <unordered_map>
@@ -2228,6 +2230,9 @@ static nb::list scalex_read_trace(const std::shared_ptr<State>& state) {
 }
 
 struct ExpertSSDAsyncBatchState {
+  const std::chrono::steady_clock::time_point started{
+      std::chrono::steady_clock::now()};
+  double elapsed_seconds{0.0};
   ExpertSSDAsyncBatchState(
       std::shared_ptr<mx::ExpertSafetensorsDirect> raw_direct,
       std::vector<size_t> expert_ids,
@@ -2540,6 +2545,8 @@ void scalex_async_batch_run(void* raw) {
   }
   {
     std::lock_guard<std::mutex> lock(state->completion_mutex);
+    state->elapsed_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - state->started).count();
     state->complete = true;
   }
   state->completion_condition.notify_all();
@@ -2549,6 +2556,9 @@ void scalex_async_batch_run(void* raw) {
 }
 
 struct ScaleXTwoBankAsyncBatchState {
+  const std::chrono::steady_clock::time_point started{
+      std::chrono::steady_clock::now()};
+  double elapsed_seconds{0.0};
   ScaleXTwoBankAsyncBatchState(
       std::shared_ptr<mx::ScaleXModeADirect> direct,
       std::vector<size_t> expert_ids,
@@ -2707,10 +2717,24 @@ void scalex_two_bank_batch_run(void* raw) {
   }
   {
     std::lock_guard<std::mutex> lock(state->completion_mutex);
+    state->elapsed_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - state->started).count();
     state->complete = true;
   }
   state->completion_condition.notify_all();
   mx::expert_ssd_io_event_signal(state->event_state, state->event_value);
+}
+
+template <typename State>
+std::optional<double> expert_ssd_async_poll(const std::shared_ptr<State>& state) {
+  if (!state) {
+    throw std::invalid_argument("[_expert_ssd_async_poll] state required");
+  }
+  std::lock_guard<std::mutex> lock(state->completion_mutex);
+  if (!state->complete) return std::nullopt;
+  std::lock_guard<std::mutex> error_lock(state->error_mutex);
+  if (state->error) std::rethrow_exception(state->error);
+  return state->elapsed_seconds;
 }
 
 template <typename State>
@@ -2735,6 +2759,10 @@ void expert_ssd_async_wait(const std::shared_ptr<State>& state) {
 }
 
 void init_ops(nb::module_& m) {
+  m.def("_expert_ssd_async_poll", &expert_ssd_async_poll<ExpertSSDAsyncBatchState>,
+        "state"_a);
+  m.def("_expert_ssd_async_poll", &expert_ssd_async_poll<ScaleXTwoBankAsyncBatchState>,
+        "state"_a);
   m.def("_scalex_mode_b_async_trace", &scalex_read_trace<ExpertSSDAsyncBatchState>);
   m.def("_scalex_mode_b_two_bank_async_trace",
         &scalex_read_trace<ScaleXTwoBankAsyncBatchState>);
