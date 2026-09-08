@@ -49,6 +49,11 @@ MLX_API array expert_ssd_gpu_event_signal(
     uint64_t value,
     StreamOrDevice s = {});
 
+// Private compatibility conversion for LivSeek's qualified MXFP4 tensors.
+MLX_API std::vector<array> livseek_legacy_mxfp4_quantize(
+    const array& weight,
+    StreamOrDevice s = {});
+
 // Non-spinning companion for a group whose rows are already resident. It
 // fuses the two launches while retaining stock fp_qmv_fast_impl arithmetic
 // and two explicit BF16 projection outputs.

@@ -1,4 +1,4 @@
-// Copyright © 2025 Apple Inc.
+// Copyright © 2025-2026 Apple Inc.
 
 // clang-format off
 #include "mlx/backend/metal/kernels/utils.h"
@@ -196,6 +196,7 @@ METAL_FUNC void dsv4_scalex_qmv_fast_impl(
   fp_qmv_fast_impl<bfloat16_t, 32, 4>(
       up_weight + ulong(slot) * weight_stride,
       up_scales + ulong(slot) * scale_stride,
+      nullptr,
       x,
       up_output + ulong(route_position) * ulong(out_vec_size),
       in_vec_size,
@@ -206,6 +207,7 @@ METAL_FUNC void dsv4_scalex_qmv_fast_impl(
   fp_qmv_fast_impl<bfloat16_t, 32, 4>(
       gate_weight + ulong(slot) * weight_stride,
       gate_scales + ulong(slot) * scale_stride,
+      nullptr,
       x,
       gate_output + ulong(route_position) * ulong(out_vec_size),
       in_vec_size,
@@ -233,6 +235,7 @@ METAL_FUNC void dsv4_scalex_qmv_fast_impl(
     fp_qmv_fast_impl<bfloat16_t, 32, 4>(
         weight,
         scales,
+        nullptr,
         x + ulong(row) * ulong(in_vec_size),
         output + ulong(row) * ulong(out_vec_size),
         in_vec_size,
@@ -267,6 +270,7 @@ METAL_FUNC void dsv4_scalex_qmv_fast_impl(
     fp_qmv_fast_impl<bfloat16_t, 32, 4>(
         weight + group * weight_stride,
         scales + group * scale_stride,
+        nullptr,
         x + group * input_stride + ulong(row) * ulong(in_vec_size),
         output + group * output_stride + ulong(row) * ulong(out_vec_size),
         in_vec_size,
@@ -292,6 +296,7 @@ METAL_FUNC void dsv4_scalex_qmv_fast_impl(
     fp_qmv_fast_impl<float, 32, 4>(
         weight,
         scales,
+        nullptr,
         x + ulong(row) * ulong(in_vec_size),
         output + ulong(row) * ulong(out_vec_size),
         in_vec_size,
@@ -324,6 +329,7 @@ METAL_FUNC void dsv4_scalex_qmv_fast_impl(
     fp_qmv_fast_impl<float, 32, 4>(
         weight + group * weight_stride,
         scales + group * scale_stride,
+        nullptr,
         x + group * input_stride + ulong(row) * ulong(in_vec_size),
         output + group * output_stride + ulong(row) * ulong(out_vec_size),
         in_vec_size,
@@ -352,6 +358,7 @@ METAL_FUNC void dsv4_scalex_qmv_fast_impl(
     fp_qmv_fast_impl<bfloat16_t, 32, 4>(
         weight,
         scales,
+        nullptr,
         x + ulong(row) * ulong(in_vec_size),
         output + ulong(row) * ulong(out_vec_size),
         in_vec_size,
@@ -384,6 +391,7 @@ METAL_FUNC void dsv4_scalex_qmv_fast_impl(
     fp_qmv_fast_impl<bfloat16_t, 32, 4>(
         weight + group * weight_stride,
         scales + group * scale_stride,
+        nullptr,
         x + group * input_stride + ulong(row) * ulong(in_vec_size),
         output + group * output_stride + ulong(row) * ulong(out_vec_size),
         in_vec_size,
@@ -409,6 +417,7 @@ METAL_FUNC void dsv4_scalex_qmv_fast_impl(
     fp_qmv_fast_impl<float, 32, 4>(
         weight,
         scales,
+        nullptr,
         x + ulong(row) * ulong(in_vec_size),
         output + ulong(row) * ulong(out_vec_size),
         in_vec_size,
@@ -441,6 +450,7 @@ METAL_FUNC void dsv4_scalex_qmv_fast_impl(
     fp_qmv_fast_impl<float, 32, 4>(
         weight + group * weight_stride,
         scales + group * scale_stride,
+        nullptr,
         x + group * input_stride + ulong(row) * ulong(in_vec_size),
         output + group * output_stride + ulong(row) * ulong(out_vec_size),
         in_vec_size,
@@ -482,6 +492,7 @@ METAL_FUNC void dsv4_scalex_qmv_fast_impl(
   fp_qmv_fast_impl<bfloat16_t, 32, 4>(
       weight + ulong(slot) * weight_stride,
       scales + ulong(slot) * scale_stride,
+      nullptr,
       x + ulong(route_position) * ulong(in_vec_size),
       output + ulong(route_position) * ulong(out_vec_size),
       in_vec_size,
@@ -1417,19 +1428,34 @@ METAL_FUNC void dsv4_scalex_mxfp4_fixed_down_reduce_bf16_impl(
 #define instantiate_quantized(mode, name, type, group_size, bits) \
   instantiate_kernel( \
       #mode "_" #name "_" #type "_gs_" #group_size "_b_" #bits, \
-      fp_ ## name, \
-      type, \
-      group_size,   \
-      bits)
+      fp_ ## name,    \
+      type,           \
+      group_size,     \
+      bits)           \
+  instantiate_kernel( \
+      #mode "_" #name "_" #type "_gs_" #group_size "_b_" #bits "_hgs", \
+      fp_ ## name,    \
+      type,           \
+      group_size,     \
+      bits,           \
+      true)
 
 #define instantiate_quantized_batched(mode, name, type, batched, group_size, bits) \
   instantiate_kernel( \
       #mode "_" #name "_" #type "_gs_" #group_size "_b_" #bits "_batch_" #batched, \
       fp_ ## name,    \
-      type,    \
-      group_size,      \
-      bits,       \
-      batched)
+      type,           \
+      group_size,     \
+      bits,           \
+      batched)        \
+  instantiate_kernel( \
+      #mode "_" #name "_" #type "_gs_" #group_size "_b_" #bits "_batch_" #batched "_hgs", \
+      fp_ ## name,    \
+      type,           \
+      group_size,     \
+      bits,           \
+      batched,        \
+      true)
 
 #define instantiate_quantized_aligned(mode, name, type, aligned, group_size, bits) \
   instantiate_kernel( \
@@ -1449,6 +1475,30 @@ METAL_FUNC void dsv4_scalex_mxfp4_fixed_down_reduce_bf16_impl(
       bits,       \
       aligned, \
       batched)
+
+#define instantiate_quantized_qmv_fast(mode, type, results, batched, group_size, bits) \
+  instantiate_kernel( \
+      #mode "_qmv_fast_" #type "_gs_" #group_size "_b_" #bits "_r_" #results "_batch_" #batched, \
+      fp_qmv_fast, \
+      type, \
+      group_size, \
+      bits, \
+      batched, \
+      false, \
+      results) \
+  instantiate_kernel( \
+      #mode "_qmv_fast_" #type "_gs_" #group_size "_b_" #bits "_r_" #results "_batch_" #batched "_hgs", \
+      fp_qmv_fast, \
+      type, \
+      group_size, \
+      bits, \
+      batched, \
+      true, \
+      results)
+
+#define instantiate_quantized_qmv_fast_r2(mode, type, group_size, bits) \
+  instantiate_quantized_qmv_fast(mode, type, 2, 1, group_size, bits) \
+  instantiate_quantized_qmv_fast(mode, type, 2, 0, group_size, bits)
 
 #define instantiate_quantized_quad(mode, name, type, D, batched, group_size, bits) \
   instantiate_kernel( \
@@ -1545,25 +1595,28 @@ METAL_FUNC void dsv4_scalex_mxfp4_fixed_down_reduce_bf16_impl(
   instantiate_gather_qmm_rhs(fp_gather_qmm_rhs, gather_qmm_rhs_nt, type, 16, 32, 32, 1, 2, true, mode, group_size, bits) \
   instantiate_gather_qmm_rhs(fp_gather_qmm_rhs, gather_qmm_rhs_nn, type, 16, 32, 32, 1, 2, false, mode, group_size, bits)
 
-#define instantiate_quantize_dequantize(type, mode, group_size, bits) \
-  instantiate_kernel( \
-    #mode "_quantize_dequantize_" #type "_gs_" #group_size "_b_" #bits, \
+#define instantiate_quantize_dequantize(type, mode, group_size, bits, has_global_scale) \
+  instantiate_kernel(       \
+    #mode "_quantize_dequantize_" #type "_gs_" #group_size "_b_" #bits "_hgs_" #has_global_scale, \
     fp_quantize_dequantize, \
-    type, \
-    group_size,  \
-    bits) \
-  instantiate_kernel( \
-    #mode "_quantize_" #type "_gs_" #group_size "_b_" #bits, \
-    fp_quantize, \
-    type, \
-    group_size,  \
-    bits) \
-  instantiate_kernel( \
-    #mode "_dequantize_" #type "_gs_" #group_size "_b_" #bits, \
-    fp_dequantize, \
-    type, \
-    group_size,  \
-    bits)
+    type,                   \
+    group_size,             \
+    bits,                   \
+    has_global_scale)       \
+  instantiate_kernel(       \
+    #mode "_quantize_" #type "_gs_" #group_size "_b_" #bits "_hgs_" #has_global_scale, \
+    fp_quantize,            \
+    type,                   \
+    group_size,             \
+    bits,                   \
+    has_global_scale)       \
+  instantiate_kernel(       \
+    #mode "_dequantize_" #type "_gs_" #group_size "_b_" #bits "_hgs_" #has_global_scale, \
+    fp_dequantize,          \
+    type,                   \
+    group_size,             \
+    bits,                   \
+    has_global_scale)
 
 #define instantiate_quantized_modes(type, mode, group_size, bits) \
   instantiate_quantized_all_batched(type, mode, group_size, bits) \
@@ -1572,13 +1625,17 @@ METAL_FUNC void dsv4_scalex_mxfp4_fixed_down_reduce_bf16_impl(
   instantiate_quantized_all_wide(type, mode, group_size, bits)    \
   instantiate_quantized_all_splitk(type, mode, group_size, bits)  \
   instantiate_quantized_all_aligned(type, mode, group_size, bits) \
-  instantiate_quantized_all_rhs(type, mode, group_size, bits)     \
-  instantiate_quantize_dequantize(type, mode, group_size, bits)
+  instantiate_quantized_all_rhs(type, mode, group_size, bits)
 
 #define instantiate_quantized_types(type) \
-  instantiate_quantized_modes(type, nvfp4, 16, 4) \
-  instantiate_quantized_modes(type, mxfp8, 32, 8) \
-  instantiate_quantized_modes(type, mxfp4, 32, 4)
+ instantiate_quantized_modes(type, nvfp4, 16, 4) \
+ instantiate_quantized_modes(type, mxfp8, 32, 8) \
+ instantiate_quantized_modes(type, mxfp4, 32, 4) \
+ instantiate_quantize_dequantize(type, nvfp4, 16, 4, false) \
+ instantiate_quantize_dequantize(type, nvfp4, 16, 4, true)  \
+ instantiate_quantize_dequantize(type, mxfp8, 32, 8, false) \
+ instantiate_quantize_dequantize(type, mxfp4, 32, 4, false) \
+ instantiate_quantized_qmv_fast_r2(nvfp4, type, 16, 4)
 
 instantiate_quantized_types(float)
 instantiate_quantized_types(bfloat16_t)
