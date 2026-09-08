@@ -1895,8 +1895,34 @@ static nb::list scalex_read_trace(const std::shared_ptr<State>& state) {
   return result;
 }
 
-struct ScaleXAsyncBatchState {
-  ScaleXAsyncBatchState(
+struct ExpertSSDAsyncBatchState {
+  ExpertSSDAsyncBatchState(
+      std::shared_ptr<mx::ExpertSafetensorsDirect> raw_direct,
+      std::vector<size_t> expert_ids,
+      std::vector<size_t> gate_up_slots,
+      std::vector<size_t> down_slots,
+      std::vector<mx::array> raw_destinations,
+      OfficialDirectDestinationRows raw_rows,
+      size_t worker_count,
+      bool interactive_qos,
+      std::shared_ptr<mx::ExpertSSDIoEventState> event_state,
+      uint64_t event_value)
+      : expert_ids(std::move(expert_ids)),
+        gate_up_slots(std::move(gate_up_slots)),
+        down_slots(std::move(down_slots)),
+        record_destinations(0),
+        gate_destinations(0),
+        down_destinations(0),
+        up_destinations(0),
+        worker_count(worker_count),
+        interactive_qos(interactive_qos),
+        event_state(std::move(event_state)),
+        event_value(event_value),
+        raw_direct(std::move(raw_direct)),
+        raw_destinations(std::move(raw_destinations)),
+        raw_rows(std::move(raw_rows)) {}
+
+  ExpertSSDAsyncBatchState(
       std::shared_ptr<mx::ScaleXModeADirect> direct,
       std::vector<size_t> expert_ids,
       std::vector<size_t> gate_up_slots,
@@ -1950,6 +1976,9 @@ struct ScaleXAsyncBatchState {
   std::mutex completion_mutex;
   std::condition_variable completion_condition;
   bool complete{false};
+  std::shared_ptr<mx::ExpertSafetensorsDirect> raw_direct;
+  std::vector<mx::array> raw_destinations;
+  OfficialDirectDestinationRows raw_rows;
 };
 
 struct ScaleXModeAAsyncBatchState {
@@ -2057,8 +2086,8 @@ void scalex_mode_a_async_batch_run(void* raw) {
 }
 
 void scalex_async_batch_worker(void* raw, size_t) {
-  auto* state = static_cast<ScaleXAsyncBatchState*>(raw);
-  const bool striped = state->direct->replica_count() == 2;
+  auto* state = static_cast<ExpertSSDAsyncBatchState*>(raw);
+  const bool striped = state->direct && state->direct->replica_count() == 2;
   const size_t task_count = state->expert_ids.size() * (striped ? 2 : 1);
   while (true) {
     const size_t task = state->next.fetch_add(1);
@@ -2071,6 +2100,23 @@ void scalex_async_batch_worker(void* raw, size_t) {
         state->read_trace.empty() ? nullptr : &state->read_trace[task],
         item, replica);
     try {
+      if (state->raw_direct) {
+        std::vector<char*> pointers(state->raw_rows.bases.size());
+        const auto& specs = state->raw_direct->specs();
+        for (size_t tensor = 0; tensor < pointers.size(); ++tensor) {
+          const bool down = specs[tensor].name.rfind("down_proj.", 0) == 0;
+          const auto slot = down ? state->down_slots[item] : state->gate_up_slots[item];
+          pointers[tensor] = state->raw_rows.bases[tensor] +
+              slot * state->raw_rows.row_nbytes[tensor];
+        }
+        state->raw_direct->load_ordered_into(
+            state->expert_ids[item], pointers, state->raw_rows.row_nbytes);
+        if (timing.record) {
+          timing.record->success = true;
+          for (auto bytes : state->raw_rows.row_nbytes) timing.record->bytes += bytes;
+        }
+        continue;
+      }
       const std::array<char*, 3> pointers{
           state->gate_base +
               state->gate_up_slots[item] * state->row_nbytes[0],
@@ -2119,8 +2165,8 @@ void scalex_async_batch_worker(void* raw, size_t) {
 }
 
 void scalex_async_batch_run(void* raw) {
-  std::unique_ptr<std::shared_ptr<ScaleXAsyncBatchState>> owner(
-      static_cast<std::shared_ptr<ScaleXAsyncBatchState>*>(raw));
+  std::unique_ptr<std::shared_ptr<ExpertSSDAsyncBatchState>> owner(
+      static_cast<std::shared_ptr<ExpertSSDAsyncBatchState>*>(raw));
   auto state = *owner;
   if (state->wait_value != 0) {
     mx::expert_ssd_io_event_wait(state->event_state, state->wait_value);
@@ -2133,17 +2179,17 @@ void scalex_async_batch_run(void* raw) {
       std::min(
           state->worker_count,
           state->expert_ids.size() *
-              (state->direct->replica_count() == 2 ? 2 : 1)),
+              (state->direct && state->direct->replica_count() == 2 ? 2 : 1)),
       queue,
       state.get(),
       scalex_async_batch_worker);
-  if (state->direct->replica_count() == 2) {
+  if (state->direct && state->direct->replica_count() == 2) {
     try {
       {
         std::lock_guard<std::mutex> lock(state->error_mutex);
         if (state->error) {
           throw std::runtime_error(
-              "[ScaleXAsyncBatchState] striped refill failed");
+              "[ExpertSSDAsyncBatchState] striped refill failed");
         }
       }
       for (size_t item = 0; item < state->expert_ids.size(); ++item) {
@@ -2336,7 +2382,7 @@ void scalex_two_bank_batch_run(void* raw) {
 }
 
 void init_ops(nb::module_& m) {
-  m.def("_scalex_mode_b_async_trace", &scalex_read_trace<ScaleXAsyncBatchState>);
+  m.def("_scalex_mode_b_async_trace", &scalex_read_trace<ExpertSSDAsyncBatchState>);
   m.def("_scalex_mode_b_two_bank_async_trace",
         &scalex_read_trace<ScaleXTwoBankAsyncBatchState>);
   nb::class_<mx::ExpertSafetensorsDirect>(m, "_ExpertSafetensorsDirect");
@@ -2344,7 +2390,8 @@ void init_ops(nb::module_& m) {
   nb::class_<mx::ScaleXModeADirect>(m, "_ScaleXModeADirect");
   nb::class_<mx::SafetensorsRowDirect>(m, "_SafetensorsRowDirect");
   nb::class_<mx::ExpertSSDIoEventState>(m, "_ExpertSSDIoEventState");
-  nb::class_<ScaleXAsyncBatchState>(m, "_ScaleXAsyncBatchState");
+  nb::class_<ExpertSSDAsyncBatchState>(m, "_ExpertSSDAsyncBatchState");
+  m.attr("_ScaleXAsyncBatchState") = m.attr("_ExpertSSDAsyncBatchState");
   nb::class_<ScaleXModeAAsyncBatchState>(
       m, "_ScaleXModeAAsyncBatchState");
   nb::class_<ScaleXTwoBankAsyncBatchState>(
@@ -4290,6 +4337,43 @@ void init_ops(nb::module_& m) {
       nb::sig(
           "def _scalex_mode_b_load_full_split_into_many(direct: _ScaleXModeADirect, expert_ids: list[int], gate_up_slots: list[int], down_slots: list[int], record_destinations: array, gate_destinations: array, down_destinations: array, up_destinations: array, weight_row_nbytes: list[int]) -> None"));
   m.def(
+      "_expert_ssd_raw_load_split_async",
+      [](std::shared_ptr<mx::ExpertSafetensorsDirect> direct,
+         std::vector<size_t> expert_ids,
+         std::vector<size_t> gate_up_slots,
+         std::vector<size_t> down_slots,
+         std::vector<mx::array> destinations,
+         size_t worker_count,
+         bool interactive_qos,
+         std::shared_ptr<mx::ExpertSSDIoEventState> event_state,
+         uint64_t event_value,
+         bool trace_enabled) {
+        if (!direct || !event_state || !event_value || !worker_count ||
+            expert_ids.empty() || expert_ids.size() != gate_up_slots.size() ||
+            expert_ids.size() != down_slots.size()) {
+          throw std::invalid_argument("[ExpertSSD raw batch] invalid arguments");
+        }
+        auto rows = validate_official_direct_destinations(direct, destinations);
+        for (size_t index = 0; index < expert_ids.size(); ++index) {
+          if (gate_up_slots[index] >= rows.capacity || down_slots[index] >= rows.capacity) {
+            throw std::out_of_range("[ExpertSSD raw batch] row is out of range");
+          }
+        }
+        auto state = std::make_shared<ExpertSSDAsyncBatchState>(
+            std::move(direct), std::move(expert_ids), std::move(gate_up_slots),
+            std::move(down_slots), std::move(destinations), std::move(rows),
+            worker_count, interactive_qos, std::move(event_state), event_value);
+        if (trace_enabled) state->read_trace.resize(state->expert_ids.size());
+        dispatch_async_f(
+            dispatch_get_global_queue(
+                interactive_qos ? QOS_CLASS_USER_INTERACTIVE : QOS_CLASS_USER_INITIATED, 0),
+            new std::shared_ptr<ExpertSSDAsyncBatchState>(state), scalex_async_batch_run);
+        return state;
+      },
+      "direct"_a, "expert_ids"_a, "gate_up_slots"_a, "down_slots"_a,
+      "destinations"_a, "worker_count"_a, "interactive_qos"_a,
+      "event_state"_a, "event_value"_a, "trace_enabled"_a = false);
+  m.def(
       "_scalex_mode_b_load_full_split_async",
       [](std::shared_ptr<mx::ScaleXModeADirect> direct,
          std::vector<size_t> expert_ids,
@@ -4362,7 +4446,7 @@ void init_ops(nb::module_& m) {
           }
         }
 
-        auto state = std::make_shared<ScaleXAsyncBatchState>(
+        auto state = std::make_shared<ExpertSSDAsyncBatchState>(
             std::move(direct),
             std::move(expert_ids),
             std::move(gate_up_slots),
@@ -4392,7 +4476,7 @@ void init_ops(nb::module_& m) {
                 interactive_qos ? QOS_CLASS_USER_INTERACTIVE
                                 : QOS_CLASS_USER_INITIATED,
                 0),
-            new std::shared_ptr<ScaleXAsyncBatchState>(state),
+            new std::shared_ptr<ExpertSSDAsyncBatchState>(state),
             scalex_async_batch_run);
         return state;
       },
@@ -4415,7 +4499,7 @@ void init_ops(nb::module_& m) {
           "def _scalex_mode_b_load_full_split_async(direct: _ScaleXModeADirect, expert_ids: list[int], gate_up_slots: list[int], down_slots: list[int], record_destinations: array, gate_destinations: array, down_destinations: array, up_destinations: array, weight_row_nbytes: list[int], worker_count: int, interactive_qos: bool, event_state: _ExpertSSDIoEventState, event_value: int, trace_enabled: bool = False, wait_value: int = 0) -> _ScaleXAsyncBatchState"));
   m.def(
       "_scalex_mode_b_async_wait",
-      [](const std::shared_ptr<ScaleXAsyncBatchState>& state) {
+      [](const std::shared_ptr<ExpertSSDAsyncBatchState>& state) {
         if (!state) {
           throw std::invalid_argument(
               "[_scalex_mode_b_async_wait] state required");
