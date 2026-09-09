@@ -246,6 +246,99 @@ METAL_FUNC void dsv4_scalex_qmv_fast_impl(
   }
 }
 
+inline void dsv4_mxfp4_qdot_pair(
+    const device ushort* packed_w,
+    const thread float* x0,
+    const thread float* x1,
+    float scale,
+    thread float& result0,
+    thread float& result1) {
+  float local0 = 0.0f;
+  float local1 = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const ushort packed = packed_w[i];
+    const float w0 = Dequantize<4>{}(packed);
+    const float w1 = Dequantize<4>{}(packed >> 4);
+    const float w2 = Dequantize<4>{}(packed >> 8);
+    const float w3 = Dequantize<4>{}(packed >> 12);
+    local0 +=
+        (x0[4 * i] * w0 + x0[4 * i + 1] * w1 +
+         x0[4 * i + 2] * w2 + x0[4 * i + 3] * w3);
+    local1 +=
+        (x1[4 * i] * w0 + x1[4 * i + 1] * w1 +
+         x1[4 * i + 2] * w2 + x1[4 * i + 3] * w3);
+  }
+  result0 += scale * local0;
+  result1 += scale * local1;
+}
+
+// Apply one packed-weight traversal to two independent BF16 rows.
+[[kernel]] void dsv4_mxfp4_two_row_dual_bf16(
+    const device uint32_t* weight [[buffer(0)]],
+    const device uint8_t* scales [[buffer(1)]],
+    const device bfloat16_t* x [[buffer(2)]],
+    device bfloat16_t* output [[buffer(3)]],
+    const constant int& in_vec_size [[buffer(4)]],
+    const constant int& out_vec_size [[buffer(5)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int values_per_thread = 16;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int results_per_simdgroup = 4;
+  const int out_row =
+      int(tid.y) * 8 + int(simd_gid) * results_per_simdgroup;
+  const int weight_row_bytes = in_vec_size / 2;
+  const int scales_per_row = in_vec_size / 32;
+
+  const device uint8_t* weight_ptr =
+      reinterpret_cast<const device uint8_t*>(weight) +
+      out_row * weight_row_bytes + simd_lid * 8;
+  const device uint8_t* scale_ptr =
+      scales + out_row * scales_per_row + simd_lid / 2;
+  const device bfloat16_t* input0 = x + simd_lid * values_per_thread;
+  const device bfloat16_t* input1 =
+      x + in_vec_size + simd_lid * values_per_thread;
+  thread float result0[results_per_simdgroup] = {0};
+  thread float result1[results_per_simdgroup] = {0};
+  thread float x0[values_per_thread];
+  thread float x1[values_per_thread];
+
+  for (int k = 0; k < in_vec_size; k += block_size) {
+#pragma unroll
+    for (int element = 0; element < values_per_thread; ++element) {
+      x0[element] = float(input0[element]);
+      x1[element] = float(input1[element]);
+    }
+#pragma unroll
+    for (int row = 0; row < results_per_simdgroup; ++row) {
+      const device ushort* packed_w =
+          reinterpret_cast<const device ushort*>(
+              weight_ptr + row * weight_row_bytes);
+      const device uint8_t* row_scales =
+          scale_ptr + row * scales_per_row;
+      const float scale = dequantize_scale<float, 32>(row_scales[0]);
+      dsv4_mxfp4_qdot_pair(
+          packed_w, x0, x1, scale, result0[row], result1[row]);
+    }
+    weight_ptr += block_size / 2;
+    scale_ptr += block_size / 32;
+    input0 += block_size;
+    input1 += block_size;
+  }
+
+#pragma unroll
+  for (int row = 0; row < results_per_simdgroup; ++row) {
+    result0[row] = simd_sum(result0[row]);
+    result1[row] = simd_sum(result1[row]);
+    if (simd_lid == 0) {
+      output[out_row + row] = bfloat16_t(result0[row]);
+      output[out_vec_size + out_row + row] = bfloat16_t(result1[row]);
+    }
+  }
+}
+
 // Batched-weight companion for MultiLinear output groups. Grid z selects one
 // independent matrix and its corresponding pair of input rows.
 [[kernel]] void dsv4_mxfp4_grouped_two_row_bf16(

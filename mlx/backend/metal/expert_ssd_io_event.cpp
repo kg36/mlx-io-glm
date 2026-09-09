@@ -1,6 +1,8 @@
 // Copyright © 2026 Apple Inc.
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 
 #include "mlx/backend/metal/device.h"
@@ -211,9 +213,14 @@ class ExpertSSDMXFP4TwoRowQMV : public Primitive {
     const int N = weight.shape(-2);
 
     auto& d = metal::device(stream().device);
+    const char* dual_value = std::getenv("LIVSEEK_WIDTH2_DUAL_QMV");
+    const bool dual_bf16 =
+        x.dtype() == bfloat16 &&
+        (dual_value == nullptr || std::strcmp(dual_value, "0") != 0);
     auto* kernel = d.get_kernel(
-        x.dtype() == bfloat16 ? "dsv4_mxfp4_two_row_bf16"
-                              : "dsv4_mxfp4_two_row_f32");
+        dual_bf16 ? "dsv4_mxfp4_two_row_dual_bf16"
+        : x.dtype() == bfloat16 ? "dsv4_mxfp4_two_row_bf16"
+                                : "dsv4_mxfp4_two_row_f32");
     auto& encoder = metal::get_command_encoder(stream());
     encoder.set_compute_pipeline_state(kernel);
     int binding = 0;
