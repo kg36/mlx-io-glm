@@ -3471,6 +3471,18 @@ void init_ops(nb::module_& m) {
       nb::sig(
           "def _expert_ssd_mxfp4_grouped_two_row_qmv(x: array, weight: array, scales: array) -> array"));
   m.def(
+      "_expert_ssd_mxfp8_two_row_qmv",
+      [](const mx::array& x,
+         const mx::array& weight,
+         const mx::array& scales) {
+        return mx::expert_ssd_mxfp8_two_row_qmv(x, weight, scales);
+      },
+      "x"_a,
+      "weight"_a,
+      "scales"_a,
+      nb::sig(
+          "def _expert_ssd_mxfp8_two_row_qmv(x: array, weight: array, scales: array) -> array"));
+  m.def(
       "_expert_ssd_mxfp4_three_row_qmv",
       [](const mx::array& x,
          const mx::array& weight,
