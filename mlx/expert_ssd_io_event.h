@@ -137,25 +137,10 @@ MLX_API array expert_ssd_scalex_mxfp4_qmv(
     uint32_t projection,
     StreamOrDevice s = {});
 
-// Scalar groups (1..8 routes) or a width-two top-six/top-eight verifier.
+// Milan GLM: scalar groups (1..8 routes) or width-two/top-eight verifier.
 MLX_API std::vector<array> expert_ssd_scalex_mxfp4_width2_pair_qmv(
     const array& x, const array& up_weight, const array& gate_weight,
     const array& scale_records, const array& routes, StreamOrDevice s = {});
-
-// Bank-transparent fixed-width peer. Each route independently selects the
-// layer-private or model-wide shared bank while Gate and Up retain the exact
-// single-bank QMV arithmetic.
-MLX_API std::vector<array> expert_ssd_scalex_mxfp4_width2_pair_qmv_two_bank(
-    const array& x,
-    const array& private_up_weight,
-    const array& private_gate_weight,
-    const array& private_scale_records,
-    const array& shared_up_weight,
-    const array& shared_gate_weight,
-    const array& shared_scale_records,
-    const array& routes,
-    const array& bank_routes,
-    StreamOrDevice s = {});
 
 // Wide-prompt peer for Gate/Up. ``x`` contains one row per token while
 // ``routes`` contains ``top_k`` physical expert rows per token. This keeps
