@@ -3613,6 +3613,39 @@ void init_ops(nb::module_& m) {
       },
       "x"_a, "up_weight"_a, "gate_weight"_a, "scale_records"_a, "routes"_a);
   m.def(
+      "_expert_ssd_scalex_mxfp4_width2_pair_qmv_two_bank",
+      [](const mx::array& x,
+         const mx::array& private_up,
+         const mx::array& private_gate,
+         const mx::array& private_records,
+         const mx::array& shared_up,
+         const mx::array& shared_gate,
+         const mx::array& shared_records,
+         const mx::array& routes,
+         const mx::array& bank_routes) {
+        return mx::expert_ssd_scalex_mxfp4_width2_pair_qmv_two_bank(
+            x,
+            private_up,
+            private_gate,
+            private_records,
+            shared_up,
+            shared_gate,
+            shared_records,
+            routes,
+            bank_routes);
+      },
+      "x"_a,
+      "private_up_weight"_a,
+      "private_gate_weight"_a,
+      "private_scale_records"_a,
+      "shared_up_weight"_a,
+      "shared_gate_weight"_a,
+      "shared_scale_records"_a,
+      "routes"_a,
+      "bank_routes"_a,
+      nb::sig(
+          "def _expert_ssd_scalex_mxfp4_width2_pair_qmv_two_bank(x: array, private_up_weight: array, private_gate_weight: array, private_scale_records: array, shared_up_weight: array, shared_gate_weight: array, shared_scale_records: array, routes: array, bank_routes: array) -> tuple[array, array]"));
+  m.def(
       "_expert_ssd_scalex_mxfp4_grouped_qmv",
       [](const mx::array& x,
          const mx::array& weight,
