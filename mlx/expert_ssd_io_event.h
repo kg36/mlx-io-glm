@@ -90,6 +90,14 @@ MLX_API array expert_ssd_mxfp8_two_row_qmv(
     const array& scales,
     StreamOrDevice s = {});
 
+// One MXFP8 matrix (or one matrix per leading group) applied to exactly three
+// BF16 rows with the canonical width-one reduction order for every row.
+MLX_API array expert_ssd_mxfp8_three_row_qmv(
+    const array& x,
+    const array& weight,
+    const array& scales,
+    StreamOrDevice s = {});
+
 // Exact three-row companions. Every verifier position retains the canonical
 // width-one reduction order while sharing one Metal dispatch.
 MLX_API array expert_ssd_mxfp4_three_row_qmv(
