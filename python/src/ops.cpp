@@ -37,6 +37,7 @@
 #include <nanobind/stl/vector.h>
 
 #include "mlx/einsum.h"
+#include "mlx/dsv4_stateful_attention.h"
 #include "mlx/expert_ssd_io_event.h"
 #include "mlx/io.h"
 #include "mlx/ops.h"
@@ -3494,6 +3495,42 @@ void init_ops(nb::module_& m) {
       "scales"_a,
       nb::sig(
           "def _expert_ssd_mxfp8_three_row_qmv(x: array, weight: array, scales: array) -> array"));
+  m.def(
+      "_dsv4_stateful_attention",
+      [](const mx::array& queries,
+         const mx::array& new_keys,
+         const mx::array& local_ring,
+         const mx::array& pooled,
+         const mx::array& indices,
+         const mx::array& pool_counts,
+         const mx::array& sinks,
+         int cache_index,
+         bool sparse,
+         float scale) {
+        return mx::dsv4_stateful_attention(
+            queries,
+            new_keys,
+            local_ring,
+            pooled,
+            indices,
+            pool_counts,
+            sinks,
+            cache_index,
+            sparse,
+            scale);
+      },
+      "queries"_a,
+      "new_keys"_a,
+      "local_ring"_a,
+      "pooled"_a,
+      "indices"_a,
+      "pool_counts"_a,
+      "sinks"_a,
+      "cache_index"_a,
+      "sparse"_a,
+      "scale"_a,
+      nb::sig(
+          "def _dsv4_stateful_attention(queries: array, new_keys: array, local_ring: array, pooled: array, indices: array, pool_counts: array, sinks: array, cache_index: int, sparse: bool, scale: float) -> list[array]"));
   m.def(
       "_expert_ssd_mxfp4_three_row_qmv",
       [](const mx::array& x,
